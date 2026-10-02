@@ -17,17 +17,43 @@ String wifiSsid;
 String wifiPassword;
 bool apMode = false;
 
+// -----------------------------------------------------------------------------
+// RX / Parser
+// -----------------------------------------------------------------------------
+
 String lastRxHex;
 unsigned long lastRxMillis = 0;
 unsigned long totalRxBytes = 0;
 
+String lastType33Hex;
+String lastType44Hex;
+
+String upsStatus = "Unbekannt";
+String upsPower = "Unbekannt";
+String upsOperation = "Unbekannt";
+
+bool lastType33ChecksumOk = false;
+bool lastType44ChecksumOk = false;
+
+unsigned long type33Count = 0;
+unsigned long type44Count = 0;
+
+uint8_t rxFrame[32];
+uint8_t rxFrameLen = 0;
+bool rxInFrame = false;
+
+// -----------------------------------------------------------------------------
+// HTML
+// -----------------------------------------------------------------------------
+
 String htmlPage(const String &title, const String &body)
 {
   String html;
-  html.reserve(6000);
+  html.reserve(8000);
 
   html += F("<!doctype html><html><head><meta charset='utf-8'>");
   html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  html += F("<meta http-equiv='refresh' content='5'>");
   html += F("<title>");
   html += title;
   html += F("</title>");
@@ -41,7 +67,11 @@ String htmlPage(const String &title, const String &body)
     "a{color:#06c}"
     ".ok{color:green}"
     ".warn{color:#b66a00}"
+    ".bad{color:#b00020}"
+    ".value{font-size:1.3em;font-weight:bold}"
     "pre{background:#111;color:#ddd;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap;word-break:break-all}"
+    "table{width:100%;border-collapse:collapse}"
+    "td{padding:7px;border-bottom:1px solid #ddd}"
     "</style></head><body>"
   );
 
@@ -51,9 +81,65 @@ String htmlPage(const String &title, const String &body)
   return html;
 }
 
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+String hexByte(uint8_t b)
+{
+  String s;
+
+  if (b < 0x10)
+    s += "0";
+
+  s += String(b, HEX);
+  s.toUpperCase();
+
+  return s;
+}
+
+String frameToHex(const uint8_t *data, uint8_t len)
+{
+  String result;
+
+  for (uint8_t i = 0; i < len; i++)
+  {
+    if (i > 0)
+      result += " ";
+
+    result += hexByte(data[i]);
+  }
+
+  return result;
+}
+
+bool checkChecksum(const uint8_t *data, uint8_t len)
+{
+  if (len < 3)
+    return false;
+
+  uint8_t checksum = 0;
+
+  // XOR aller Bytes zwischen TYPE und CHECKSUM
+  // Beispiel:
+  // 85 33 02 23 00 21
+  //       02 ^ 23 ^ 00 = 21
+  for (uint8_t i = 2; i < len - 1; i++)
+  {
+    checksum ^= data[i];
+  }
+
+  return checksum == data[len - 1];
+}
+
+// -----------------------------------------------------------------------------
+// WLAN configuration
+// -----------------------------------------------------------------------------
+
 void saveConfig()
 {
   File file = LittleFS.open(CONFIG_FILE, "w");
+
   if (!file)
     return;
 
@@ -68,6 +154,7 @@ bool loadConfig()
     return false;
 
   File file = LittleFS.open(CONFIG_FILE, "r");
+
   if (!file)
     return false;
 
@@ -139,6 +226,215 @@ bool connectWifi()
   return false;
 }
 
+// -----------------------------------------------------------------------------
+// MGE parser
+// -----------------------------------------------------------------------------
+
+void processType33(const uint8_t *frame, uint8_t len)
+{
+  lastType33Hex = frameToHex(frame, len);
+  lastType33ChecksumOk = checkChecksum(frame, len);
+  type33Count++;
+
+  if (!lastType33ChecksumOk)
+  {
+    upsStatus = "Checksum Fehler";
+    upsPower = "Unbekannt";
+    upsOperation = "Unbekannt";
+
+    return;
+  }
+
+  // Bekannte TYPE-33 Telegramme
+
+  if (len == 6 &&
+      frame[0] == 0x85 &&
+      frame[1] == 0x33 &&
+      frame[2] == 0x02 &&
+      frame[3] == 0x23 &&
+      frame[4] == 0x00 &&
+      frame[5] == 0x21)
+  {
+    upsStatus = "EIN";
+    upsPower = "Netz vorhanden";
+    upsOperation = "ONLINE";
+  }
+  else if (len == 6 &&
+           frame[0] == 0x85 &&
+           frame[1] == 0x33 &&
+           frame[2] == 0x02 &&
+           frame[3] == 0x24 &&
+           frame[4] == 0x00 &&
+           frame[5] == 0x26)
+  {
+    upsStatus = "EIN";
+    upsPower = "Netz fehlt";
+    upsOperation = "BATTERIE";
+  }
+  else if (len == 6 &&
+           frame[0] == 0x85 &&
+           frame[1] == 0x33 &&
+           frame[2] == 0x02 &&
+           frame[3] == 0x03 &&
+           frame[4] == 0x00 &&
+           frame[5] == 0x01)
+  {
+    upsStatus = "AUS";
+    upsPower = "Netz vorhanden";
+    upsOperation = "OFFLINE";
+  }
+  else if (len == 6 &&
+           frame[0] == 0x85 &&
+           frame[1] == 0x33 &&
+           frame[2] == 0x02 &&
+           frame[3] == 0x00 &&
+           frame[4] == 0x00 &&
+           frame[5] == 0x02)
+  {
+    upsStatus = "AUS";
+    upsPower = "Netz fehlt";
+    upsOperation = "OFFLINE / NETZAUSFALL";
+  }
+  else
+  {
+    // Unbekanntes TYPE-33 Telegramm:
+    // Telegramm trotzdem anzeigen, aber nichts hineininterpretieren.
+    upsStatus = "Unbekannter Status";
+    upsPower = "Unbekannt";
+    upsOperation = "Unbekannt";
+  }
+}
+
+void processType44(const uint8_t *frame, uint8_t len)
+{
+  lastType44Hex = frameToHex(frame, len);
+  lastType44ChecksumOk = checkChecksum(frame, len);
+  type44Count++;
+}
+
+void processFrame(const uint8_t *frame, uint8_t len)
+{
+  if (len < 2)
+    return;
+
+  if (frame[0] != 0x85)
+    return;
+
+  switch (frame[1])
+  {
+    case 0x33:
+      if (len == 6)
+        processType33(frame, len);
+      break;
+
+    case 0x44:
+      if (len == 7)
+        processType44(frame, len);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void feedMgeByte(uint8_t b)
+{
+  // Telegrammstart
+  if (!rxInFrame)
+  {
+    if (b == 0x85)
+    {
+      rxInFrame = true;
+      rxFrameLen = 0;
+      rxFrame[rxFrameLen++] = b;
+    }
+
+    return;
+  }
+
+  // Buffer overflow protection
+  if (rxFrameLen >= sizeof(rxFrame))
+  {
+    rxInFrame = false;
+    rxFrameLen = 0;
+    return;
+  }
+
+  rxFrame[rxFrameLen++] = b;
+
+  // TYPE 33 = 6 Bytes
+  if (rxFrameLen == 2 && rxFrame[1] == 0x33)
+    return;
+
+  if (rxFrameLen == 6 && rxFrame[1] == 0x33)
+  {
+    processFrame(rxFrame, rxFrameLen);
+
+    rxInFrame = false;
+    rxFrameLen = 0;
+
+    return;
+  }
+
+  // TYPE 44 = 7 Bytes
+  if (rxFrameLen == 2 && rxFrame[1] == 0x44)
+    return;
+
+  if (rxFrameLen == 7 && rxFrame[1] == 0x44)
+  {
+    processFrame(rxFrame, rxFrameLen);
+
+    rxInFrame = false;
+    rxFrameLen = 0;
+
+    return;
+  }
+
+  // Unbekannter TYPE
+  if (rxFrameLen == 2 &&
+      rxFrame[1] != 0x33 &&
+      rxFrame[1] != 0x44)
+  {
+    rxInFrame = false;
+    rxFrameLen = 0;
+  }
+}
+
+void readMgeSerial()
+{
+  bool received = false;
+
+  while (mgeSerial.available())
+  {
+    uint8_t b = mgeSerial.read();
+
+    if (lastRxHex.length() > 4000)
+      lastRxHex.remove(0, 2000);
+
+    if (lastRxHex.length() > 0)
+      lastRxHex += " ";
+
+    lastRxHex += hexByte(b);
+
+    totalRxBytes++;
+    lastRxMillis = millis();
+    received = true;
+
+    // Parser
+    feedMgeByte(b);
+
+    // USB-Debug
+    Serial.printf("%02X ", b);
+  }
+
+  if (received)
+    Serial.println();
+}
+
+// -----------------------------------------------------------------------------
+// Web pages
+// -----------------------------------------------------------------------------
+
 void handleRoot()
 {
   String body;
@@ -167,7 +463,7 @@ void handleRoot()
     "<h2>USV</h2>"
     "<p>Interface: 2400 Baud / 8N1</p>"
     "<p>RX: D5 &nbsp;&nbsp; TX: D6</p>"
-    "<p><a href='/ups'>USV Live Monitor</a></p>"
+    "<p><a href='/ups'>USV Monitor</a></p>"
     "</div>"
   );
 
@@ -188,31 +484,108 @@ void handleUps()
 {
   String body;
 
-  body += F("<div class='card'><h1>USV Live Monitor</h1>");
+  body += F("<div class='card'>");
+  body += F("<h1>USV Status</h1>");
 
-  body += F("<p><b>Interface:</b> 2400 Baud / 8N1</p>");
-  body += F("<p><b>RX:</b> D5 &nbsp;&nbsp; <b>TX:</b> D6</p>");
+  body += F("<table>");
 
-  body += F("<p><b>Total RX bytes:</b> ");
+  body += F("<tr><td>USV</td><td class='value'>");
+  body += upsStatus;
+  body += F("</td></tr>");
+
+  body += F("<tr><td>Netz</td><td>");
+  body += upsPower;
+  body += F("</td></tr>");
+
+  body += F("<tr><td>Betrieb</td><td>");
+  body += upsOperation;
+  body += F("</td></tr>");
+
+  body += F("</table>");
+  body += F("</div>");
+
+  body += F("<div class='card'>");
+  body += F("<h2>Kommunikation</h2>");
+
+  body += F("<table>");
+
+  body += F("<tr><td>Interface</td><td>2400 8N1</td></tr>");
+  body += F("<tr><td>RX</td><td>D5</td></tr>");
+  body += F("<tr><td>TX</td><td>D6</td></tr>");
+
+  body += F("<tr><td>Total RX Bytes</td><td>");
   body += String(totalRxBytes);
-  body += F("</p>");
+  body += F("</td></tr>");
 
-  body += F("<p><b>Last RX:</b> ");
+  body += F("<tr><td>TYPE 33 Telegramme</td><td>");
+  body += String(type33Count);
+  body += F("</td></tr>");
+
+  body += F("<tr><td>TYPE 44 Telegramme</td><td>");
+  body += String(type44Count);
+  body += F("</td></tr>");
+
+  body += F("<tr><td>Letzter RX</td><td>");
 
   if (lastRxMillis == 0)
   {
-    body += F("never");
+    body += F("noch keiner");
   }
   else
   {
-    unsigned long age = (millis() - lastRxMillis) / 1000;
-    body += String(age);
-    body += F(" s ago");
+    body += String((millis() - lastRxMillis) / 1000);
+    body += F(" Sekunden");
   }
 
-  body += F("</p>");
+  body += F("</td></tr>");
 
-  body += F("<h3>Raw RX</h3>");
+  body += F("</table>");
+  body += F("</div>");
+
+  body += F("<div class='card'>");
+  body += F("<h2>TYPE 33 – Status</h2>");
+
+  if (lastType33Hex.length() == 0)
+  {
+    body += F("<p>Noch kein TYPE-33-Telegramm empfangen.</p>");
+  }
+  else
+  {
+    body += F("<pre>");
+    body += lastType33Hex;
+    body += F("</pre>");
+
+    if (lastType33ChecksumOk)
+      body += F("<p class='ok'>Checksum: OK</p>");
+    else
+      body += F("<p class='bad'>Checksum: FEHLER</p>");
+  }
+
+  body += F("</div>");
+
+  body += F("<div class='card'>");
+  body += F("<h2>TYPE 44 – Rohdaten</h2>");
+
+  if (lastType44Hex.length() == 0)
+  {
+    body += F("<p>Noch kein TYPE-44-Telegramm empfangen.</p>");
+  }
+  else
+  {
+    body += F("<pre>");
+    body += lastType44Hex;
+    body += F("</pre>");
+
+    if (lastType44ChecksumOk)
+      body += F("<p class='ok'>Checksum: OK</p>");
+    else
+      body += F("<p class='bad'>Checksum: FEHLER</p>");
+  }
+
+  body += F("</div>");
+
+  body += F("<div class='card'>");
+  body += F("<h2>Raw RX</h2>");
 
   if (lastRxHex.length() == 0)
   {
@@ -225,7 +598,10 @@ void handleUps()
     body += F("</pre>");
   }
 
+  body += F("</div>");
+
   body += F(
+    "<div class='card'>"
     "<p><a href='/ups'>Refresh</a></p>"
     "<p><a href='/'>Back</a></p>"
     "</div>"
@@ -304,37 +680,9 @@ void handleSave()
   ESP.restart();
 }
 
-void readMgeSerial()
-{
-  bool received = false;
-
-  while (mgeSerial.available())
-  {
-    uint8_t b = mgeSerial.read();
-
-    if (lastRxHex.length() > 4000)
-    {
-      lastRxHex.remove(0, 2000);
-    }
-
-    if (b < 0x10)
-      lastRxHex += "0";
-
-    lastRxHex += String(b, HEX);
-    lastRxHex += " ";
-
-    totalRxBytes++;
-    received = true;
-
-    Serial.printf("%02X ", b);
-  }
-
-  if (received)
-  {
-    lastRxMillis = millis();
-    Serial.println();
-  }
-}
+// -----------------------------------------------------------------------------
+// Setup / Loop
+// -----------------------------------------------------------------------------
 
 void setup()
 {
@@ -343,7 +691,7 @@ void setup()
   delay(300);
 
   Serial.println();
-  Serial.println("MGE UPS Controller v0.2");
+  Serial.println("MGE UPS Controller v0.3");
   Serial.println("----------------------");
 
   if (!LittleFS.begin())
