@@ -117,6 +117,14 @@ void logPrintln()
   logBuffer = "";
 }
 
+void logPrintln(const IPAddress &value)
+{
+  Serial.println(value);
+  appendLogText(value.toString());
+  writeLogLine(logBuffer);
+  logBuffer = "";
+}
+
 template <typename T>
 void logPrintln(const T &value)
 {
