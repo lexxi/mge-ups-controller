@@ -3,13 +3,20 @@
 #include <ESP8266WebServer.h>
 #include <LittleFS.h>
 #include <SoftwareSerial.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define MGE_RX_PIN D5
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.6.1";
+static const char *APP_VERSION = "0.7.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
+static const char *LOG_FILE = "/logs/system.log";
+static const size_t LOG_MAX_BYTES = 128 * 1024;
+
+String logBuffer;
+bool logReady = false;
 
 ESP8266WebServer server(80);
 SoftwareSerial mgeSerial(MGE_RX_PIN, MGE_TX_PIN);
@@ -17,6 +24,161 @@ SoftwareSerial mgeSerial(MGE_RX_PIN, MGE_TX_PIN);
 String wifiSsid;
 String wifiPassword;
 bool apMode = false;
+
+// -----------------------------------------------------------------------------
+// Persistent logger
+// -----------------------------------------------------------------------------
+
+String logTimestamp()
+{
+  time_t now = time(nullptr);
+
+  if (now > 1700000000)
+  {
+    struct tm tmNow;
+    localtime_r(&now, &tmNow);
+
+    char buffer[32];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tmNow);
+    return String(buffer);
+  }
+
+  return String("+") + String(millis() / 1000.0, 3) + "s";
+}
+
+void writeLogLine(const String &line)
+{
+  if (!logReady)
+    return;
+
+  if (LittleFS.exists(LOG_FILE))
+  {
+    File existing = LittleFS.open(LOG_FILE, "r");
+    if (existing)
+    {
+      size_t currentSize = existing.size();
+      existing.close();
+
+      if (currentSize >= LOG_MAX_BYTES)
+        LittleFS.remove(LOG_FILE);
+    }
+  }
+
+  File file = LittleFS.open(LOG_FILE, "a");
+
+  if (!file)
+    return;
+
+  file.print("[");
+  file.print(logTimestamp());
+  file.print("] ");
+  file.println(line);
+  file.close();
+}
+
+void appendLogText(const String &text)
+{
+  for (size_t i = 0; i < text.length(); i++)
+  {
+    char c = text[i];
+
+    if (c == '\n')
+    {
+      if (logBuffer.endsWith("\r"))
+        logBuffer.remove(logBuffer.length() - 1);
+
+      writeLogLine(logBuffer);
+      logBuffer = "";
+    }
+    else
+    {
+      logBuffer += c;
+
+      if (logBuffer.length() > 1024)
+      {
+        writeLogLine(logBuffer);
+        logBuffer = "";
+      }
+    }
+  }
+}
+
+template <typename T>
+void Serial.print(const T &value)
+{
+  Serial.print(value);
+  appendLogText(String(value));
+}
+
+void Serial.println()
+{
+  Serial.println();
+  writeLogLine(logBuffer);
+  logBuffer = "";
+}
+
+template <typename T>
+void Serial.println(const T &value)
+{
+  Serial.println(value);
+  appendLogText(String(value));
+  writeLogLine(logBuffer);
+  logBuffer = "";
+}
+
+void Serial.printf(const char *format, ...)
+{
+  char buffer[512];
+
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  Serial.print(buffer);
+  appendLogText(String(buffer));
+}
+
+void initLogger()
+{
+  if (!LittleFS.exists("/logs"))
+  {
+    // LittleFS does not require directories to be created explicitly on all
+    // ESP8266 versions; create the log file directly instead.
+  }
+
+  File file = LittleFS.open(LOG_FILE, "a");
+
+  if (file)
+  {
+    file.close();
+    logReady = true;
+  }
+}
+
+void syncClock()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  // Austria: CET/CEST with automatic DST transition.
+  configTime("CET-1CEST,M3.5.0,M10.5.0",
+             "pool.ntp.org",
+             "time.nist.gov");
+
+  unsigned long start = millis();
+
+  while (time(nullptr) < 1700000000 &&
+         millis() - start < 5000)
+  {
+    delay(100);
+  }
+
+  if (time(nullptr) >= 1700000000)
+    Serial.println("NTP time synchronized");
+  else
+    Serial.println("NTP synchronization unavailable; using uptime timestamps");
+}
 
 // -----------------------------------------------------------------------------
 // RX / Parser
@@ -205,14 +367,14 @@ void startAccessPoint()
   WiFi.mode(WIFI_AP);
   WiFi.softAP(hostname.c_str(), AP_PASSWORD);
 
-  Serial.println();
-  Serial.println("Fallback AP started");
-  Serial.print("SSID: ");
-  Serial.println(hostname);
-  Serial.print("Password: ");
-  Serial.println(AP_PASSWORD);
-  Serial.print("IP: ");
-  Serial.println(WiFi.softAPIP());
+  logPrintln();
+  logPrintln("Fallback AP started");
+  logPrint("SSID: ");
+  logPrintln(hostname);
+  logPrint("Password: ");
+  logPrintln(AP_PASSWORD);
+  logPrint("IP: ");
+  logPrintln(WiFi.softAPIP());
 }
 
 bool connectWifi()
@@ -223,7 +385,7 @@ bool connectWifi()
   WiFi.mode(WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 
-  Serial.print("Connecting to WiFi");
+  logPrint("Connecting to WiFi");
 
   unsigned long start = millis();
 
@@ -231,23 +393,23 @@ bool connectWifi()
          millis() - start < 15000)
   {
     delay(250);
-    Serial.print(".");
+    logPrint(".");
   }
 
-  Serial.println();
+  logPrintln();
 
   if (WiFi.status() == WL_CONNECTED)
   {
     apMode = false;
 
-    Serial.println("WiFi connected");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+    logPrintln("WiFi connected");
+    logPrint("IP: ");
+    logPrintln(WiFi.localIP());
 
     return true;
   }
 
-  Serial.println("WiFi connection failed");
+  logPrintln("WiFi connection failed");
 
   return false;
 }
@@ -270,13 +432,13 @@ void clearShutRx()
 
 void printHexLine(const char *prefix, const uint8_t *data, size_t len)
 {
-  Serial.print(prefix);
+  logPrint(prefix);
   for (size_t i = 0; i < len; i++)
   {
-    if (i > 0) Serial.print(" ");
-    Serial.printf("%02X", data[i]);
+    if (i > 0) logPrint(" ");
+    logPrintf("%02X", data[i]);
   }
-  Serial.println();
+  logPrintln();
 }
 
 void sendShutGetReport(uint8_t reportId)
@@ -331,7 +493,7 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
     if (type == 0x06 || type == 0x15 ||
         type == 0x16 || type == 0x17 || type == 0x18)
     {
-      Serial.printf("SHUT token: %02X\n", type);
+      logPrintf("SHUT token: %02X\n", type);
       continue;
     }
 
@@ -344,7 +506,7 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
     if (!mgeSerial.available())
     {
-      Serial.println("Timeout waiting for SHUT length byte");
+      logPrintln("Timeout waiting for SHUT length byte");
       continue;
     }
 
@@ -352,7 +514,7 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
     if ((lenByte >> 4) != (lenByte & 0x0F))
     {
-      Serial.printf("Invalid SHUT length byte: %02X\n", lenByte);
+      logPrintf("Invalid SHUT length byte: %02X\n", lenByte);
       continue;
     }
 
@@ -360,7 +522,7 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
     if (len > 8)
     {
-      Serial.printf("Invalid SHUT payload length: %u\n", len);
+      logPrintf("Invalid SHUT payload length: %u\n", len);
       mgeSerial.write(0x15); // NACK
       mgeSerial.flush();
       continue;
@@ -377,7 +539,7 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
       if (!mgeSerial.available())
       {
-        Serial.println("Timeout while receiving SHUT payload");
+        logPrintln("Timeout while receiving SHUT payload");
         return outLen > 0;
       }
 
@@ -391,24 +553,24 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
     if (!mgeSerial.available())
     {
-      Serial.println("Timeout waiting for SHUT checksum");
+      logPrintln("Timeout waiting for SHUT checksum");
       return outLen > 0;
     }
 
     uint8_t receivedChecksum = mgeSerial.read();
 
-    Serial.printf("SHUT RX packet: type=%02X len=%u chk=%02X/%02X\n",
+    logPrintf("SHUT RX packet: type=%02X len=%u chk=%02X/%02X\n",
                   type, len, receivedChecksum, checksum);
 
     if (receivedChecksum != checksum)
     {
-      Serial.println("SHUT checksum: BAD");
+      logPrintln("SHUT checksum: BAD");
       mgeSerial.write(0x15); // NACK
       mgeSerial.flush();
       continue;
     }
 
-    Serial.println("SHUT checksum: OK");
+    logPrintln("SHUT checksum: OK");
 
     for (uint8_t i = 0; i < len; i++)
     {
@@ -424,14 +586,14 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
     // LAST flag is in the high bit of bType, not in bLength.
     if (type & 0x80)
     {
-      Serial.println("SHUT RX: LAST packet");
+      logPrintln("SHUT RX: LAST packet");
       return true;
     }
 
-    Serial.println("SHUT RX: more fragments");
+    logPrintln("SHUT RX: more fragments");
   }
 
-  Serial.println("SHUT RX: timeout");
+  logPrintln("SHUT RX: timeout");
   return outLen > 0;
 }
 
@@ -691,11 +853,11 @@ void readMgeSerial()
 
     feedMgeByte(b);
 
-    Serial.printf("%02X ", b);
+    logPrintf("%02X ", b);
   }
 
   if (received)
-    Serial.println();
+    logPrintln();
 }
 
 // -----------------------------------------------------------------------------
@@ -732,7 +894,8 @@ void handleRoot()
     "<h2>USV</h2>"
     "<p>Interface: 2400 Baud / 8N1</p>"
     "<p>RX: D5 &nbsp;&nbsp; TX: D6</p>"
-    "<p><a href='/ups'>USV Monitor</a></p>"
+    "<p><a href='/ups'>USV Monitor</a></p>
+    <p><a href='/logs'>System Logs</a></p>"
     "</div>"
   );
 
@@ -1020,6 +1183,89 @@ void handleUps()
   );
 }
 
+void handleLogs()
+{
+  File file = LittleFS.open(LOG_FILE, "r");
+
+  if (!file)
+  {
+    server.send(200, "text/plain; charset=utf-8", "No log entries.");
+    return;
+  }
+
+  String body;
+  body.reserve(16000);
+
+  size_t size = file.size();
+
+  // Keep the web page responsive; full log remains available via download.
+  if (size > 16000)
+  {
+    file.seek(size - 16000, SeekSet);
+    body = "[... log gekürzt; vollständiger Log über Download ...]\\n";
+  }
+
+  while (file.available())
+    body += file.readStringUntil('\n') + "\n";
+
+  file.close();
+
+  String page;
+  page.reserve(body.length() + 1500);
+  page += "<!doctype html><html><head><meta charset='utf-8'>";
+  page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>MGE Logs</title>";
+  page += "<style>body{font-family:Arial;max-width:1000px;margin:20px auto;padding:0 15px}";
+  page += "pre{background:#111;color:#ddd;padding:15px;white-space:pre-wrap;overflow:auto}";
+  page += "a,button{display:inline-block;padding:9px 14px;margin:4px}</style></head><body>";
+  page += "<h1>System Log</h1>";
+  page += "<p><a href='/logs/download'>Log herunterladen</a>";
+  page += "<a href='/logs/clear' onclick=\"return confirm('Log wirklich löschen?')\">Log löschen</a>";
+  page += "<a href='/'>Zurück</a></p>";
+  page += "<pre>";
+  page += body;
+  page += "</pre></body></html>";
+
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+void handleLogDownload()
+{
+  File file = LittleFS.open(LOG_FILE, "r");
+
+  if (!file)
+  {
+    server.send(404, "text/plain", "Log file not found");
+    return;
+  }
+
+  server.sendHeader(
+    "Content-Disposition",
+    "attachment; filename=mge-ups-system.log"
+  );
+
+  server.streamFile(file, "text/plain; charset=utf-8");
+  file.close();
+}
+
+void handleLogClear()
+{
+  LittleFS.remove(LOG_FILE);
+
+  File file = LittleFS.open(LOG_FILE, "a");
+  if (file)
+    file.close();
+
+  server.send(
+    200,
+    "text/html; charset=utf-8",
+    "<html><body><h1>Log gelöscht</h1>"
+    "<p><a href='/logs'>Zurück zum Log</a></p></body></html>"
+  );
+
+  logPrintln("System log cleared");
+}
+
 void handleConfig()
 {
   String body;
@@ -1094,34 +1340,41 @@ void setup()
 
   delay(300);
 
-  Serial.println();
-  Serial.print("MGE UPS Controller v");
-  Serial.println(APP_VERSION);
-  Serial.println("----------------------");
+  logPrintln();
+  logPrint("MGE UPS Controller v");
+  logPrintln(APP_VERSION);
+  logPrintln("----------------------");
 
   if (!LittleFS.begin())
   {
-    Serial.println("LittleFS mount failed");
+    logPrintln("LittleFS mount failed");
   }
 
   mgeSerial.begin(2400);
 
-  Serial.println("MGE serial initialized: 2400 8N1");
-  Serial.println("RX=D5 TX=D6");
+  logPrintln("MGE serial initialized: 2400 8N1");
+  logPrintln("RX=D5 TX=D6");
 
   if (!connectWifi())
   {
     startAccessPoint();
   }
+  else
+  {
+    syncClock();
+  }
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/ups", HTTP_GET, handleUps);
+  server.on("/logs", HTTP_GET, handleLogs);
+  server.on("/logs/download", HTTP_GET, handleLogDownload);
+  server.on("/logs/clear", HTTP_GET, handleLogClear);
   server.on("/config", HTTP_GET, handleConfig);
   server.on("/save", HTTP_POST, handleSave);
 
   server.begin();
 
-  Serial.println("HTTP server started");
+  logPrintln("HTTP server started");
 }
 
 void loop()
