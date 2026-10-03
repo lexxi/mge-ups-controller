@@ -149,9 +149,14 @@ void logPrintf(const char *format, ...)
 
 void initLogger()
 {
-  // Keep the persistent log in the LittleFS root. This avoids depending on
-  // directory creation/support across ESP8266 LittleFS versions.
-  File file = LittleFS.open(LOG_FILE, "a");
+  // Keep the persistent log in the LittleFS root. Create it explicitly first
+  // because some ESP8266 LittleFS builds are picky about append mode.
+  File file;
+
+  if (LittleFS.exists(LOG_FILE))
+    file = LittleFS.open(LOG_FILE, "a");
+  else
+    file = LittleFS.open(LOG_FILE, "w");
 
   if (file)
   {
@@ -161,7 +166,7 @@ void initLogger()
   }
   else
   {
-    Serial.println("ERROR: cannot open persistent log file");
+    Serial.println("ERROR: cannot create/open persistent log file");
   }
 }
 
@@ -1308,6 +1313,11 @@ void handleLogs()
   page += "pre{background:#111;color:#ddd;padding:15px;white-space:pre-wrap;overflow:auto}";
   page += "a,button{display:inline-block;padding:9px 14px;margin:4px}</style></head><body>";
   page += "<h1>System Log</h1>";
+  page += "<p>Firmware: v";
+  page += APP_VERSION;
+  page += " | Datei: ";
+  page += String(size);
+  page += " Bytes</p>";
   page += "<p><a href='/logs/download'>Log herunterladen</a>";
   page += "<a href='/logs/clear' onclick=\"return confirm('Log wirklich löschen?')\">Log löschen</a>";
   page += "<a href='/'>Zurück</a></p>";
