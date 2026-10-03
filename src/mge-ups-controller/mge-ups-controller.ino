@@ -8,7 +8,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.6";
+static const char *APP_VERSION = "0.6.1";
 static const char *CONFIG_FILE = "/wifi.cfg";
 
 ESP8266WebServer server(80);
@@ -62,7 +62,8 @@ uint16_t type44P2P3 = 0;
 bool shutTelemetryValid = false;
 uint8_t shutCapacity = 0;
 uint16_t shutRuntimeSeconds = 0;
-uint16_t shutVoltageRaw = 0;
+uint8_t shutVoltage = 0;
+uint8_t shutLoadPercent = 0;
 bool shutVoltageValid = false;
 unsigned long shutLastPollMillis = 0;
 static const unsigned long SHUT_POLL_INTERVAL_MS = 15000;
@@ -467,8 +468,10 @@ void pollShutTelemetry()
 
   if (getReport(0x0E) && responseLen >= 3 && response[0] == 0x0E)
   {
-    shutVoltageRaw = (uint16_t)response[1] |
-                     ((uint16_t)response[2] << 8);
+    // Report 0x0E contains two independent 8-bit fields:
+    // byte 1 = Voltage, byte 2 = PercentLoad.
+    shutVoltage = response[1];
+    shutLoadPercent = response[2];
     shutVoltageValid = true;
   }
 
@@ -839,14 +842,17 @@ void handleUps()
     body += String(seconds); body += F(" min");
   } else body += F("Unbekannt");
   body += F("</td></tr>");
-  body += F("<tr><td>Report 0x0E Rohwert</td><td>");
+  body += F("<tr><td>Spannung</td><td>");
   if (shutVoltageValid) {
-    body += String(shutVoltageRaw); body += F(" (0x");
-    String voltageHex = String(shutVoltageRaw, HEX); voltageHex.toUpperCase();
-    body += voltageHex; body += F(")");
+    body += String(shutVoltage); body += F(" V");
+  } else body += F("Unbekannt");
+  body += F("</td></tr>");
+  body += F("<tr><td>Last</td><td>");
+  if (shutVoltageValid) {
+    body += String(shutLoadPercent); body += F(" %");
   } else body += F("Unbekannt");
   body += F("</td></tr></table>");
-  body += F("<p><small>SHUT-Werte werden aktiv per GET REPORT abgefragt. 0x0E wird noch nicht skaliert.</small></p></div>");
+  body += F("<p><small>SHUT-Werte werden aktiv per GET REPORT abgefragt. Report 0x0E: Spannung + Last.</small></p></div>");
 
   // TYPE 44
   // ---------------------------------------------------------------------------
