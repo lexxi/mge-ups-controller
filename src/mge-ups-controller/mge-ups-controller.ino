@@ -640,6 +640,21 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
     logPrintf("SHUT RX packet: type=%02X len=%u chk=%02X/%02X\n",
               type, len, receivedChecksum, checksum);
 
+    if (receivedChecksum == checksum)
+    {
+      logPrint("SHUT RX payload: ");
+
+      for (uint8_t i = 0; i < len; i++)
+      {
+        if (i > 0)
+          logPrint(" ");
+
+        logPrintf("%02X", frame[i]);
+      }
+
+      logPrintln();
+    }
+
     if (receivedChecksum != checksum)
     {
       logPrintln("SHUT checksum: BAD");
