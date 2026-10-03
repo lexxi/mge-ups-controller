@@ -104,13 +104,13 @@ void appendLogText(const String &text)
 }
 
 template <typename T>
-void Serial.print(const T &value)
+void logPrint(const T &value)
 {
   Serial.print(value);
   appendLogText(String(value));
 }
 
-void Serial.println()
+void logPrintln()
 {
   Serial.println();
   writeLogLine(logBuffer);
@@ -118,7 +118,7 @@ void Serial.println()
 }
 
 template <typename T>
-void Serial.println(const T &value)
+void logPrintln(const T &value)
 {
   Serial.println(value);
   appendLogText(String(value));
@@ -126,7 +126,7 @@ void Serial.println(const T &value)
   logBuffer = "";
 }
 
-void Serial.printf(const char *format, ...)
+void logPrintf(const char *format, ...)
 {
   char buffer[512];
 
@@ -894,8 +894,8 @@ void handleRoot()
     "<h2>USV</h2>"
     "<p>Interface: 2400 Baud / 8N1</p>"
     "<p>RX: D5 &nbsp;&nbsp; TX: D6</p>"
-    "<p><a href='/ups'>USV Monitor</a></p>
-    <p><a href='/logs'>System Logs</a></p>"
+    "<p><a href='/ups'>USV Monitor</a></p>"
+    "<p><a href='/logs'>System Logs</a></p>"
     "</div>"
   );
 
