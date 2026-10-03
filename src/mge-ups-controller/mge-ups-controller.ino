@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.7.1";
+static const char *APP_VERSION = "0.7.2";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
