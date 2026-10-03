@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.7.3";
+static const char *APP_VERSION = "0.7.4";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -28,6 +28,26 @@ bool apMode = false;
 // -----------------------------------------------------------------------------
 // Persistent logger
 // -----------------------------------------------------------------------------
+
+String formatUptime()
+{
+  unsigned long seconds = millis() / 1000UL;
+  unsigned long days = seconds / 86400UL;
+  seconds %= 86400UL;
+  unsigned long hours = seconds / 3600UL;
+  seconds %= 3600UL;
+  unsigned long minutes = seconds / 60UL;
+  seconds %= 60UL;
+
+  char buffer[48];
+
+  if (days > 0)
+    snprintf(buffer, sizeof(buffer), "%lu d %02lu:%02lu:%02lu", days, hours, minutes, seconds);
+  else
+    snprintf(buffer, sizeof(buffer), "%02lu:%02lu:%02lu", hours, minutes, seconds);
+
+  return String(buffer);
+}
 
 String logTimestamp()
 {
@@ -1085,7 +1105,12 @@ void handleUps()
 
   // ---------------------------------------------------------------------------
   // SHUT telemetry
-  body += F("<div class='card'><h2>SHUT – Telemetrie</h2><table>");
+  body += F("<div class='card'><h2>SHUT – Telemetrie</h2>");
+  body += F("<p><small>Firmware v");
+  body += APP_VERSION;
+  body += F(" | Uptime ");
+  body += formatUptime();
+  body += F("</small></p><table>");
   body += F("<tr><td>Batterie</td><td>");
   if (shutTelemetryValid) { body += String(shutCapacity); body += F(" %"); }
   else body += F("Unbekannt");
