@@ -482,6 +482,86 @@ void sendShutGetReport(uint8_t reportId)
 
 
 
+bool readShutByte(uint8_t &b, uint32_t timeoutMs)
+{
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs)
+  {
+    if (mgeSerial.available())
+    {
+      b = mgeSerial.read();
+      return true;
+    }
+
+    yield();
+  }
+
+  return false;
+}
+
+bool consumeAsyncMgeFrame(uint8_t firstByte)
+{
+  // Spontaneous MGE status/telemetry frames use the normal 0x85 frame
+  // header and fixed lengths:
+  //   85 33 ... = 6 bytes
+  //   85 44 ... = 7 bytes
+  // They can arrive while a SHUT GET_REPORT response is pending.
+  if (firstByte != 0x85)
+    return false;
+
+  uint8_t frame[7];
+  frame[0] = firstByte;
+
+  if (!readShutByte(frame[1], 1000))
+  {
+    logPrintln("Async MGE frame: timeout waiting for type");
+    return true;
+  }
+
+  uint8_t expectedLen = 0;
+
+  if (frame[1] == 0x33)
+    expectedLen = 6;
+  else if (frame[1] == 0x44)
+    expectedLen = 7;
+  else
+  {
+    logPrintf("Async MGE frame: unknown type %02X\n", frame[1]);
+    return true;
+  }
+
+  for (uint8_t i = 2; i < expectedLen; i++)
+  {
+    if (!readShutByte(frame[i], 1000))
+    {
+      logPrintf("Async MGE frame: timeout at byte %u\n", i);
+      return true;
+    }
+  }
+
+  if (!checkChecksum(frame, expectedLen))
+  {
+    logPrintln("Async MGE frame: checksum BAD");
+    return true;
+  }
+
+  logPrintf("Async MGE frame: %02X ", frame[1]);
+
+  for (uint8_t i = 0; i < expectedLen; i++)
+  {
+    if (i > 0)
+      logPrint(" ");
+
+    logPrintf("%02X", frame[i]);
+  }
+
+  logPrintln();
+
+  processFrame(frame, expectedLen);
+  return true;
+}
+
 bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t timeoutMs)
 {
   outLen = 0;
@@ -489,16 +569,21 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
   while ((long)(millis() - deadline) < 0)
   {
-    if (!mgeSerial.available())
+    uint8_t type;
+
+    if (!readShutByte(type, 50))
+      continue;
+
+    // The UPS can send spontaneous TYPE-33/TYPE-44 frames while we are
+    // waiting for a GET_REPORT response. Consume them as complete frames
+    // instead of treating 0x85 as a SHUT packet type.
+    if (type == 0x85)
     {
-      yield();
+      consumeAsyncMgeFrame(type);
       continue;
     }
 
-    uint8_t type = mgeSerial.read();
-
     // Standalone protocol tokens can appear before a SHUT packet.
-    // 0x06 is an ACK and must be consumed before parsing the response.
     if (type == 0x06 || type == 0x15 ||
         type == 0x16 || type == 0x17 || type == 0x18)
     {
@@ -506,20 +591,13 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
       continue;
     }
 
-    // The length byte may arrive a few milliseconds after the type byte.
-    // Do not discard the type and restart parsing if the byte is not
-    // immediately available.
-    unsigned long lenWaitStart = millis();
-    while (!mgeSerial.available() && millis() - lenWaitStart < 500)
-      yield();
+    uint8_t lenByte;
 
-    if (!mgeSerial.available())
+    if (!readShutByte(lenByte, 500))
     {
       logPrintln("Timeout waiting for SHUT length byte");
       continue;
     }
-
-    uint8_t lenByte = mgeSerial.read();
 
     if ((lenByte >> 4) != (lenByte & 0x0F))
     {
@@ -532,7 +610,7 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
     if (len > 8)
     {
       logPrintf("Invalid SHUT payload length: %u\n", len);
-      mgeSerial.write(0x15); // NACK
+      mgeSerial.write(0x15);
       mgeSerial.flush();
       continue;
     }
@@ -542,39 +620,30 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
     for (uint8_t i = 0; i < len; i++)
     {
-      unsigned long waitStart = millis();
-      while (!mgeSerial.available() && millis() - waitStart < 1000)
-        yield();
-
-      if (!mgeSerial.available())
+      if (!readShutByte(frame[i], 1000))
       {
         logPrintln("Timeout while receiving SHUT payload");
         return outLen > 0;
       }
 
-      frame[i] = mgeSerial.read();
       checksum ^= frame[i];
     }
 
-    unsigned long waitStart = millis();
-    while (!mgeSerial.available() && millis() - waitStart < 1000)
-      yield();
+    uint8_t receivedChecksum;
 
-    if (!mgeSerial.available())
+    if (!readShutByte(receivedChecksum, 1000))
     {
       logPrintln("Timeout waiting for SHUT checksum");
       return outLen > 0;
     }
 
-    uint8_t receivedChecksum = mgeSerial.read();
-
     logPrintf("SHUT RX packet: type=%02X len=%u chk=%02X/%02X\n",
-                  type, len, receivedChecksum, checksum);
+              type, len, receivedChecksum, checksum);
 
     if (receivedChecksum != checksum)
     {
       logPrintln("SHUT checksum: BAD");
-      mgeSerial.write(0x15); // NACK
+      mgeSerial.write(0x15);
       mgeSerial.flush();
       continue;
     }
@@ -587,12 +656,9 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
         out[outLen++] = frame[i];
     }
 
-    // ACK every valid packet. The UPS waits for this before sending
-    // the next fragment.
     mgeSerial.write(0x06);
     mgeSerial.flush();
 
-    // LAST flag is in the high bit of bType, not in bLength.
     if (type & 0x80)
     {
       logPrintln("SHUT RX: LAST packet");
@@ -605,7 +671,6 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
   logPrintln("SHUT RX: timeout");
   return outLen > 0;
 }
-
 
 void pollShutTelemetry()
 {
