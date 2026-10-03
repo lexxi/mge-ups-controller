@@ -12,7 +12,7 @@
 static const char *AP_PASSWORD = "mgeups123";
 static const char *APP_VERSION = "0.7.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
-static const char *LOG_FILE = "/logs/system.log";
+static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
 
 String logBuffer;
@@ -149,18 +149,19 @@ void logPrintf(const char *format, ...)
 
 void initLogger()
 {
-  if (!LittleFS.exists("/logs"))
-  {
-    // LittleFS does not require directories to be created explicitly on all
-    // ESP8266 versions; create the log file directly instead.
-  }
-
+  // Keep the persistent log in the LittleFS root. This avoids depending on
+  // directory creation/support across ESP8266 LittleFS versions.
   File file = LittleFS.open(LOG_FILE, "a");
 
   if (file)
   {
     file.close();
     logReady = true;
+    Serial.println("Persistent logger initialized");
+  }
+  else
+  {
+    Serial.println("ERROR: cannot open persistent log file");
   }
 }
 
@@ -183,9 +184,9 @@ void syncClock()
   }
 
   if (time(nullptr) >= 1700000000)
-    Serial.println("NTP time synchronized");
+    logPrintln("NTP time synchronized");
   else
-    Serial.println("NTP synchronization unavailable; using uptime timestamps");
+    logPrintln("NTP synchronization unavailable; using uptime timestamps");
 }
 
 // -----------------------------------------------------------------------------
