@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.7.2";
+static const char *APP_VERSION = "0.7.3";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -1279,6 +1279,11 @@ void handleUps()
 
 void handleLogs()
 {
+  // Never let the browser cache an old log page.
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+
   File file = LittleFS.open(LOG_FILE, "r");
 
   if (!file)
@@ -1321,9 +1326,12 @@ void handleLogs()
   page += "<p><a href='/logs/download'>Log herunterladen</a>";
   page += "<a href='/logs/clear' onclick=\"return confirm('Log wirklich löschen?')\">Log löschen</a>";
   page += "<a href='/'>Zurück</a></p>";
-  page += "<pre>";
+  page += "<pre id='log'>";
   page += body;
-  page += "</pre></body></html>";
+  page += "</pre>";
+  page += "<script>";
+  page += "setTimeout(function(){ location.reload(); }, 2000);";
+  page += "</script></body></html>";
 
   server.send(200, "text/html; charset=utf-8", page);
 }
