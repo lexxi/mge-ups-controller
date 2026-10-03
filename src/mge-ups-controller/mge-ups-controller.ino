@@ -1356,7 +1356,11 @@ void setup()
 
   if (!LittleFS.begin())
   {
-    logPrintln("LittleFS mount failed");
+    Serial.println("LittleFS mount failed");
+  }
+  else
+  {
+    initLogger();
   }
 
   mgeSerial.begin(2400);
