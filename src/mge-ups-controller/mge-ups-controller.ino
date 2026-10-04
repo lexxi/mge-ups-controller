@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.9.0";
+static const char *APP_VERSION = "0.9.1";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -526,6 +526,80 @@ void recordRxByte(uint8_t b)
   lastRxMillis = millis();
 }
 
+void sendShutGetDescriptor(uint8_t descriptorType, uint16_t requestedLength)
+{
+  // USB/HID GET_DESCRIPTOR over SHUT.
+  // For HID and report descriptors bmRequestType must be 0x81.
+  uint8_t hidData[8] = {
+    0x81,                                   // bmRequestType: HID/interface
+    0x06,                                   // bRequest: GET_DESCRIPTOR
+    0x00,                                   // wValue LSB: descriptor index
+    descriptorType,                         // wValue MSB: descriptor type
+    0x00,                                   // wIndex LSB
+    0x00,                                   // wIndex MSB
+    (uint8_t)(requestedLength & 0xFF),       // wLength LSB
+    (uint8_t)(requestedLength >> 8)          // wLength MSB
+  };
+
+  uint8_t packet[11];
+  packet[0] = 0x81;
+  packet[1] = 0x88;
+
+  for (uint8_t i = 0; i < 8; i++)
+    packet[2 + i] = hidData[i];
+
+  packet[10] = shutChecksum(hidData, 8);
+
+  printHexLine("SHUT GET DESCRIPTOR TX: ", packet, sizeof(packet));
+  mgeSerial.write(packet, sizeof(packet));
+  mgeSerial.flush();
+}
+
+bool syncShut(uint32_t timeoutMs = 1200)
+{
+  clearShutRx();
+  mgeSerial.write(0x16);
+  mgeSerial.flush();
+
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs)
+  {
+    if (mgeSerial.available())
+    {
+      uint8_t b = mgeSerial.read();
+      recordRxByte(b);
+
+      if (b == 0x16)
+        return true;
+    }
+
+    yield();
+  }
+
+  return false;
+}
+
+bool getShutDescriptor(uint8_t descriptorType,
+                       uint8_t *out,
+                       size_t outMax,
+                       size_t &outLen,
+                       uint16_t requestedLength)
+{
+  outLen = 0;
+
+  if (!syncShut())
+  {
+    logPrintln("SHUT descriptor: sync failed");
+    return false;
+  }
+
+  clearShutRx();
+  sendShutGetDescriptor(descriptorType, requestedLength);
+
+  return receiveShutResponse(out, outMax, outLen, 5000);
+}
+
 bool readShutByte(uint8_t &b, uint32_t timeoutMs)
 {
   unsigned long start = millis();
@@ -742,19 +816,9 @@ void pollShutTelemetry()
 
   auto getReport = [&](uint8_t reportId) -> bool {
     responseLen = 0;
-    clearShutRx();
-    mgeSerial.write(0x16);
-    mgeSerial.flush();
-    unsigned long start = millis();
-    bool syncOk = false;
-    while (millis() - start < 1200) {
-      if (mgeSerial.available()) {
-        uint8_t b = mgeSerial.read();
-        if (b == 0x16) { syncOk = true; break; }
-      }
-      yield();
-    }
-    if (!syncOk) return false;
+    if (!syncShut())
+      return false;
+
     clearShutRx();
     sendShutGetReport(reportId);
     return receiveShutResponse(response, sizeof(response), responseLen, 2500);
@@ -1117,6 +1181,42 @@ void handleApiStatus()
   server.send(200, "application/json; charset=utf-8", json);
 }
 
+void handleApiHidReportDescriptor()
+{
+  static const size_t MAX_DESCRIPTOR = 512;
+  uint8_t descriptor[MAX_DESCRIPTOR];
+  size_t descriptorLen = 0;
+
+  bool ok = getShutDescriptor(
+      0x22,                 // HID report descriptor
+      descriptor,
+      sizeof(descriptor),
+      descriptorLen,
+      MAX_DESCRIPTOR);
+
+  String json;
+  json.reserve(descriptorLen * 3 + 256);
+
+  json += F("{\"ok\":");
+  json += jsonBool(ok);
+  json += F(",\"descriptor_type\":\"0x22\",\"length\":");
+  json += String(descriptorLen);
+  json += F(",\"hex\":\"");
+
+  for (size_t i = 0; i < descriptorLen; i++)
+  {
+    if (i > 0)
+      json += " ";
+
+    json += hexByte(descriptor[i]);
+  }
+
+  json += F("\"}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(ok ? 200 : 503, "application/json; charset=utf-8", json);
+}
+
 void handleApiHealth()
 {
   bool commOk = shutTelemetryValid || presentStatusCount > 0;
@@ -1174,6 +1274,7 @@ void handleRoot()
     "<p><a href='/ups'>USV Monitor</a></p>"
     "<p><a href='/api/status'>API Status (JSON)</a></p>"
     "<p><a href='/api/health'>API Health (JSON)</a></p>"
+    "<p><a href='/api/hid/report-descriptor'>HID Report Descriptor (JSON)</a></p>"
     "<p><a href='/logs'>System Logs</a></p>"
     "</div>"
   );
@@ -1638,6 +1739,7 @@ void setup()
   server.on("/ups", HTTP_GET, handleUps);
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/health", HTTP_GET, handleApiHealth);
+  server.on("/api/hid/report-descriptor", HTTP_GET, handleApiHidReportDescriptor);
   server.on("/logs", HTTP_GET, handleLogs);
   server.on("/logs/download", HTTP_GET, handleLogDownload);
   server.on("/logs/clear", HTTP_GET, handleLogClear);
