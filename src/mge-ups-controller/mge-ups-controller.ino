@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.9.3";
+static const char *APP_VERSION = "0.9.4";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -598,7 +598,7 @@ bool getShutDescriptor(uint8_t descriptorType,
   sendShutGetDescriptor(descriptorType, requestedLength);
 
   if (requestedLength > 64)
-    return receiveShutResponseExact(out, outMax, outLen, requestedLength, 12000);
+    return receiveShutResponseExact(out, outMax, outLen, requestedLength, 30000);
 
   return receiveShutResponse(out, outMax, outLen, 5000);
 }
@@ -882,9 +882,8 @@ bool receiveShutResponseExact(uint8_t *out,
       return outLen == expectedLen;
     }
 
-    logPrintf("SHUT RX packet: type=%02X len=%u chk=%02X/%02X total=%u/%u\n",
-              type, len, receivedChecksum, checksum,
-              (unsigned int)outLen, (unsigned int)expectedLen);
+    // Keep bulk descriptor reads quiet. Persistent logging for every
+    // 8-byte SHUT fragment can delay SoftwareSerial enough to lose data.
 
     if (receivedChecksum != checksum)
     {
@@ -909,12 +908,9 @@ bool receiveShutResponseExact(uint8_t *out,
       return true;
     }
 
-    if ((type & 0x80) != 0)
+    if ((type & 0x80) != 0 && (outLen % 64 == 0))
     {
-      // Some MGE devices end a SHUT block after 64 bytes even when the
-      // underlying USB/HID transfer is longer. Continue collecting until
-      // the requested HID length is reached.
-      logPrintf("SHUT RX exact: block end at %u/%u, continuing\n",
+      logPrintf("SHUT RX exact: progress %u/%u bytes\n",
                 (unsigned int)outLen,
                 (unsigned int)expectedLen);
     }
