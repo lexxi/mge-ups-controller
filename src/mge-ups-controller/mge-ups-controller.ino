@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.11.0";
+static const char *APP_VERSION = "0.12.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -2147,6 +2147,57 @@ void handleUps()
   }
 
   body += F("<p><small>Letzte 30 gültigen HID-Reports 0x16. Verlauf liegt nur im RAM und wird beim Neustart gelöscht.</small></p>");
+  body += F("</div>");
+
+  // ---------------------------------------------------------------------------
+  // Control
+  // ---------------------------------------------------------------------------
+
+  body += F("<div class='card'>");
+  body += F("<h2>Steuerung</h2>");
+  body += F("<p><b>Shutdown-Timer:</b> <span id='shutdownTimer'>-</span><br>");
+  body += F("<b>Startup-Timer:</b> <span id='startupTimer'>-</span></p>");
+
+  body += F("<p>");
+  body += F("<button onclick=\"controlPost('/api/control/shutdown?delay=30')\">Shutdown in 30 s</button> ");
+  body += F("<button onclick=\"controlPost('/api/control/shutdown/cancel')\">Shutdown abbrechen</button>");
+  body += F("</p>");
+
+  body += F("<p>");
+  body += F("<button onclick=\"controlPost('/api/control/startup?delay=300')\">Startup in 300 s</button> ");
+  body += F("<button onclick=\"controlPost('/api/control/startup/cancel')\">Startup abbrechen</button>");
+  body += F("</p>");
+
+  body += F("<p id='controlResult'><small>Timerstatus wird alle 5 Sekunden aktualisiert.</small></p>");
+
+  body += F("<script>"
+            "async function refreshControl(){"
+            "try{"
+            "const r=await fetch('/api/control/status',{cache:'no-store'});"
+            "const j=await r.json();"
+            "document.getElementById('shutdownTimer').textContent="
+            "j.shutdown.seconds===null?'inaktiv':j.shutdown.seconds+' s';"
+            "document.getElementById('startupTimer').textContent="
+            "j.startup.seconds===null?'inaktiv':j.startup.seconds+' s';"
+            "}catch(e){"
+            "document.getElementById('controlResult').textContent='Control-Status konnte nicht geladen werden';"
+            "}"
+            "}"
+            "async function controlPost(url){"
+            "try{"
+            "const r=await fetch(url,{method:'POST'});"
+            "const j=await r.json();"
+            "document.getElementById('controlResult').textContent="
+            "j.ok?'Befehl angenommen':'Befehl fehlgeschlagen';"
+            "await refreshControl();"
+            "}catch(e){"
+            "document.getElementById('controlResult').textContent='Fehler beim Senden';"
+            "}"
+            "}"
+            "refreshControl();"
+            "setInterval(refreshControl,5000);"
+            "</script>");
+
   body += F("</div>");
 
   // ---------------------------------------------------------------------------
