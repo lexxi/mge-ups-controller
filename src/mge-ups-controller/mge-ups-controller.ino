@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.8.0";
+static const char *APP_VERSION = "0.8.1";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -513,6 +513,19 @@ void sendShutGetReport(uint8_t reportId)
 
 
 
+void recordRxByte(uint8_t b)
+{
+  if (lastRxHex.length() > 4000)
+    lastRxHex.remove(0, 2000);
+
+  if (lastRxHex.length() > 0)
+    lastRxHex += " ";
+
+  lastRxHex += hexByte(b);
+  totalRxBytes++;
+  lastRxMillis = millis();
+}
+
 bool readShutByte(uint8_t &b, uint32_t timeoutMs)
 {
   unsigned long start = millis();
@@ -522,6 +535,7 @@ bool readShutByte(uint8_t &b, uint32_t timeoutMs)
     if (mgeSerial.available())
     {
       b = mgeSerial.read();
+      recordRxByte(b);
       return true;
     }
 
@@ -746,6 +760,15 @@ void pollShutTelemetry()
     return receiveShutResponse(response, sizeof(response), responseLen, 2500);
   };
 
+  if (getReport(0x02) && responseLen >= 3 && response[0] == 0x02)
+  {
+    lastPresentStatusHex = frameToHex(response, responseLen);
+    presentStatusChecksumOk = true;
+    presentStatusCount++;
+    applyPresentStatusPayload(response, responseLen);
+    updateUpsStateFromPresentStatus();
+  }
+
   if (getReport(0x0E) && responseLen >= 3 && response[0] == 0x0E)
   {
     // Report 0x0E contains two independent 8-bit fields:
@@ -757,15 +780,59 @@ void pollShutTelemetry()
 
   if (getReport(0x16) && responseLen >= 4 && response[0] == 0x16)
   {
-    shutCapacity = response[1];
-    shutRuntimeSeconds = (uint16_t)response[2] |
-                         ((uint16_t)response[3] << 8);
-    shutTelemetryValid = true;
+    lastBatteryReportHex = frameToHex(response, responseLen);
+    batteryReportChecksumOk = true;
+    batteryReportCount++;
+    storeBatteryPayload(response, responseLen);
   }
 }
 
 // SHUT/HID notification parser
 // -----------------------------------------------------------------------------
+
+void applyPresentStatusPayload(const uint8_t *payload, size_t len)
+{
+  if (len < 3 || payload[0] != 0x02)
+    return;
+
+  presentStatusBits =
+      static_cast<uint16_t>(payload[1]) |
+      (static_cast<uint16_t>(payload[2]) << 8);
+
+  statusAcPresent          = presentStatusBits & (1u << 0);
+  statusCharging           = presentStatusBits & (1u << 1);
+  statusDischarging        = presentStatusBits & (1u << 2);
+  statusBelowCapacityLimit = presentStatusBits & (1u << 3);
+  statusNeedReplacement    = presentStatusBits & (1u << 4);
+  statusGood               = presentStatusBits & (1u << 5);
+  statusShutdownImminent   = presentStatusBits & (1u << 6);
+  statusOverload           = presentStatusBits & (1u << 7);
+  statusInternalFailure    = presentStatusBits & (1u << 8);
+}
+
+void storeBatteryPayload(const uint8_t *payload, size_t len)
+{
+  if (len < 4 || payload[0] != 0x16)
+    return;
+
+  shutCapacity = payload[1];
+  shutRuntimeSeconds =
+      static_cast<uint16_t>(payload[2]) |
+      (static_cast<uint16_t>(payload[3]) << 8);
+
+  shutTelemetryValid = true;
+
+  BatteryHistoryEntry &entry = batteryHistory[batteryHistoryNext];
+  entry.millisAt = millis();
+  entry.capacity = shutCapacity;
+  entry.runtimeSeconds = shutRuntimeSeconds;
+
+  batteryHistoryNext =
+      (batteryHistoryNext + 1) % BATTERY_HISTORY_SIZE;
+
+  if (batteryHistoryCount < BATTERY_HISTORY_SIZE)
+    batteryHistoryCount++;
+}
 
 void updateUpsStateFromPresentStatus()
 {
@@ -806,20 +873,7 @@ void processPresentStatusReport(const uint8_t *frame, uint8_t len)
   if (!presentStatusChecksumOk || len < 6 || frame[2] != 0x02)
     return;
 
-  presentStatusBits =
-      static_cast<uint16_t>(frame[3]) |
-      (static_cast<uint16_t>(frame[4]) << 8);
-
-  statusAcPresent          = presentStatusBits & (1u << 0);
-  statusCharging           = presentStatusBits & (1u << 1);
-  statusDischarging        = presentStatusBits & (1u << 2);
-  statusBelowCapacityLimit = presentStatusBits & (1u << 3);
-  statusNeedReplacement    = presentStatusBits & (1u << 4);
-  statusGood               = presentStatusBits & (1u << 5);
-  statusShutdownImminent   = presentStatusBits & (1u << 6);
-  statusOverload           = presentStatusBits & (1u << 7);
-  statusInternalFailure    = presentStatusBits & (1u << 8);
-
+  applyPresentStatusPayload(&frame[2], len - 3);
   updateUpsStateFromPresentStatus();
 }
 
@@ -832,23 +886,7 @@ void processBatteryReport(const uint8_t *frame, uint8_t len)
   if (!batteryReportChecksumOk || len < 7 || frame[2] != 0x16)
     return;
 
-  shutCapacity = frame[3];
-  shutRuntimeSeconds =
-      static_cast<uint16_t>(frame[4]) |
-      (static_cast<uint16_t>(frame[5]) << 8);
-
-  shutTelemetryValid = true;
-
-  BatteryHistoryEntry &entry = batteryHistory[batteryHistoryNext];
-  entry.millisAt = millis();
-  entry.capacity = shutCapacity;
-  entry.runtimeSeconds = shutRuntimeSeconds;
-
-  batteryHistoryNext =
-      (batteryHistoryNext + 1) % BATTERY_HISTORY_SIZE;
-
-  if (batteryHistoryCount < BATTERY_HISTORY_SIZE)
-    batteryHistoryCount++;
+  storeBatteryPayload(&frame[2], len - 3);
 }
 
 bool processShutNotifyFrame(const uint8_t *frame, uint8_t len)
@@ -947,16 +985,7 @@ void readMgeSerial()
   {
     uint8_t b = mgeSerial.read();
 
-    if (lastRxHex.length() > 4000)
-      lastRxHex.remove(0, 2000);
-
-    if (lastRxHex.length() > 0)
-      lastRxHex += " ";
-
-    lastRxHex += hexByte(b);
-
-    totalRxBytes++;
-    lastRxMillis = millis();
+    recordRxByte(b);
     received = true;
 
     feedMgeByte(b);
@@ -1147,7 +1176,7 @@ void handleUps()
     body += String(shutLoadPercent); body += F(" %");
   } else body += F("Unbekannt");
   body += F("</td></tr></table>");
-  body += F("<p><small>SHUT-Werte werden aktiv per GET REPORT abgefragt. Report 0x0E: Spannung + Last; Report 0x16: Batterie + Restlaufzeit.</small></p></div>");
+  body += F("<p><small>SHUT-Werte werden aktiv per GET REPORT abgefragt. Report 0x02: Status; Report 0x0E: Spannung + Last; Report 0x16: Batterie + Restlaufzeit.</small></p></div>");
 
   // ---------------------------------------------------------------------------
   // HID Report 0x16 / Battery
