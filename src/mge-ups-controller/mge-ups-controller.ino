@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.9.2";
+static const char *APP_VERSION = "0.9.3";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -597,6 +597,9 @@ bool getShutDescriptor(uint8_t descriptorType,
   clearShutRx();
   sendShutGetDescriptor(descriptorType, requestedLength);
 
+  if (requestedLength > 64)
+    return receiveShutResponseExact(out, outMax, outLen, requestedLength, 12000);
+
   return receiveShutResponse(out, outMax, outLen, 5000);
 }
 
@@ -802,6 +805,126 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
 
   logPrintln("SHUT RX: timeout");
   return outLen > 0;
+}
+
+bool receiveShutResponseExact(uint8_t *out,
+                              size_t outMax,
+                              size_t &outLen,
+                              size_t expectedLen,
+                              uint32_t timeoutMs)
+{
+  outLen = 0;
+  unsigned long deadline = millis() + timeoutMs;
+
+  while ((long)(millis() - deadline) < 0 && outLen < expectedLen)
+  {
+    uint8_t type;
+
+    if (!readShutByte(type, 50))
+      continue;
+
+    if (type == 0x85)
+    {
+      consumeAsyncShutNotify(type);
+      continue;
+    }
+
+    if (type == 0x06 || type == 0x15 ||
+        type == 0x16 || type == 0x17 || type == 0x18)
+    {
+      logPrintf("SHUT token: %02X\n", type);
+      continue;
+    }
+
+    uint8_t lenByte;
+
+    if (!readShutByte(lenByte, 500))
+    {
+      logPrintln("Timeout waiting for SHUT length byte");
+      continue;
+    }
+
+    if ((lenByte >> 4) != (lenByte & 0x0F))
+    {
+      logPrintf("Invalid SHUT length byte: %02X\n", lenByte);
+      continue;
+    }
+
+    uint8_t len = lenByte & 0x0F;
+
+    if (len > 8)
+    {
+      logPrintf("Invalid SHUT payload length: %u\n", len);
+      mgeSerial.write(0x15);
+      mgeSerial.flush();
+      continue;
+    }
+
+    uint8_t frame[8];
+    uint8_t checksum = 0;
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+      if (!readShutByte(frame[i], 1000))
+      {
+        logPrintln("Timeout while receiving SHUT payload");
+        return outLen == expectedLen;
+      }
+
+      checksum ^= frame[i];
+    }
+
+    uint8_t receivedChecksum;
+
+    if (!readShutByte(receivedChecksum, 1000))
+    {
+      logPrintln("Timeout waiting for SHUT checksum");
+      return outLen == expectedLen;
+    }
+
+    logPrintf("SHUT RX packet: type=%02X len=%u chk=%02X/%02X total=%u/%u\n",
+              type, len, receivedChecksum, checksum,
+              (unsigned int)outLen, (unsigned int)expectedLen);
+
+    if (receivedChecksum != checksum)
+    {
+      logPrintln("SHUT checksum: BAD");
+      mgeSerial.write(0x15);
+      mgeSerial.flush();
+      continue;
+    }
+
+    for (uint8_t i = 0; i < len; i++)
+    {
+      if (outLen < outMax && outLen < expectedLen)
+        out[outLen++] = frame[i];
+    }
+
+    mgeSerial.write(0x06);
+    mgeSerial.flush();
+
+    if (outLen >= expectedLen)
+    {
+      logPrintf("SHUT RX exact: complete %u bytes\n", (unsigned int)outLen);
+      return true;
+    }
+
+    if ((type & 0x80) != 0)
+    {
+      // Some MGE devices end a SHUT block after 64 bytes even when the
+      // underlying USB/HID transfer is longer. Continue collecting until
+      // the requested HID length is reached.
+      logPrintf("SHUT RX exact: block end at %u/%u, continuing\n",
+                (unsigned int)outLen,
+                (unsigned int)expectedLen);
+    }
+  }
+
+  logPrintf("SHUT RX exact: incomplete %u/%u bytes\n",
+            (unsigned int)outLen,
+            (unsigned int)expectedLen);
+
+  return outLen == expectedLen;
 }
 
 void pollShutTelemetry()
