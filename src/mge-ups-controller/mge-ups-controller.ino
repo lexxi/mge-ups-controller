@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.7.4";
+static const char *APP_VERSION = "0.8.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -222,39 +222,45 @@ String lastRxHex;
 unsigned long lastRxMillis = 0;
 unsigned long totalRxBytes = 0;
 
-String lastType33Hex;
-String lastType44Hex;
+String lastPresentStatusHex;
+String lastBatteryReportHex;
 
 String upsStatus = "Unbekannt";
 String upsPower = "Unbekannt";
 String upsOperation = "Unbekannt";
 
-bool lastType33ChecksumOk = false;
-bool lastType44ChecksumOk = false;
+bool presentStatusChecksumOk = false;
+bool batteryReportChecksumOk = false;
 
-unsigned long type33Count = 0;
-unsigned long type44Count = 0;
+unsigned long presentStatusCount = 0;
+unsigned long batteryReportCount = 0;
 
-// Last 30 TYPE-44 values, kept in RAM for live analysis.
-static const uint8_t TYPE44_HISTORY_SIZE = 30;
-struct Type44HistoryEntry
+// HID Report 0x02 / UPS.PowerSummary.PresentStatus
+uint16_t presentStatusBits = 0;
+bool statusAcPresent = false;
+bool statusCharging = false;
+bool statusDischarging = false;
+bool statusBelowCapacityLimit = false;
+bool statusNeedReplacement = false;
+bool statusGood = false;
+bool statusShutdownImminent = false;
+bool statusOverload = false;
+bool statusInternalFailure = false;
+
+// Last 30 HID Report 0x16 values, kept in RAM for live analysis.
+static const uint8_t BATTERY_HISTORY_SIZE = 30;
+struct BatteryHistoryEntry
 {
   unsigned long millisAt;
-  uint8_t p0;
-  uint8_t p1;
-  uint16_t p2p3;
+  uint8_t capacity;
+  uint16_t runtimeSeconds;
 };
 
-Type44HistoryEntry type44History[TYPE44_HISTORY_SIZE];
-uint8_t type44HistoryCount = 0;
-uint8_t type44HistoryNext = 0;
+BatteryHistoryEntry batteryHistory[BATTERY_HISTORY_SIZE];
+uint8_t batteryHistoryCount = 0;
+uint8_t batteryHistoryNext = 0;
 
-// TYPE 44 decoded fields – deliberately no physical interpretation
-uint8_t type44P0 = 0;
-uint8_t type44P1 = 0;
-uint16_t type44P2P3 = 0;
-
-// Confirmed SHUT GET REPORT values (read-only).
+// Confirmed SHUT/HID GET_REPORT values.
 bool shutTelemetryValid = false;
 uint8_t shutCapacity = 0;
 uint16_t shutRuntimeSeconds = 0;
@@ -525,65 +531,64 @@ bool readShutByte(uint8_t &b, uint32_t timeoutMs)
   return false;
 }
 
-bool consumeAsyncMgeFrame(uint8_t firstByte)
+bool processShutNotifyFrame(const uint8_t *frame, uint8_t len);
+
+bool consumeAsyncShutNotify(uint8_t firstByte)
 {
-  // Spontaneous MGE status/telemetry frames use the normal 0x85 frame
-  // header and fixed lengths:
-  //   85 33 ... = 6 bytes
-  //   85 44 ... = 7 bytes
-  // They can arrive while a SHUT GET_REPORT response is pending.
+  // SHUT NOTIFY packet:
+  //   byte 0 = packet type (0x85 = NOTIFY + LAST)
+  //   byte 1 = mirrored payload length (e.g. 0x33 => 3 bytes)
+  //   payload = HID report ID + report data
+  //   final byte = XOR checksum over payload only
   if (firstByte != 0x85)
     return false;
 
-  uint8_t frame[7];
+  uint8_t frame[12];
   frame[0] = firstByte;
 
   if (!readShutByte(frame[1], 1000))
   {
-    logPrintln("Async MGE frame: timeout waiting for type");
+    logPrintln("SHUT NOTIFY: timeout waiting for length");
     return true;
   }
 
-  uint8_t expectedLen = 0;
+  uint8_t lenByte = frame[1];
 
-  if (frame[1] == 0x33)
-    expectedLen = 6;
-  else if (frame[1] == 0x44)
-    expectedLen = 7;
-  else
+  if ((lenByte >> 4) != (lenByte & 0x0F))
   {
-    logPrintf("Async MGE frame: unknown type %02X\n", frame[1]);
+    logPrintf("SHUT NOTIFY: invalid length byte %02X\n", lenByte);
     return true;
   }
+
+  uint8_t payloadLen = lenByte & 0x0F;
+
+  if (payloadLen == 0 || payloadLen > 8)
+  {
+    logPrintf("SHUT NOTIFY: invalid payload length %u\n", payloadLen);
+    return true;
+  }
+
+  uint8_t expectedLen = payloadLen + 3;
 
   for (uint8_t i = 2; i < expectedLen; i++)
   {
     if (!readShutByte(frame[i], 1000))
     {
-      logPrintf("Async MGE frame: timeout at byte %u\n", i);
+      logPrintf("SHUT NOTIFY: timeout at byte %u\n", i);
       return true;
     }
   }
 
+  printHexLine("SHUT NOTIFY RX: ", frame, expectedLen);
+
   if (!checkChecksum(frame, expectedLen))
   {
-    logPrintln("Async MGE frame: checksum BAD");
+    logPrintln("SHUT NOTIFY checksum: BAD");
     return true;
   }
 
-  logPrintf("Async MGE frame: %02X ", frame[1]);
-
-  for (uint8_t i = 0; i < expectedLen; i++)
-  {
-    if (i > 0)
-      logPrint(" ");
-
-    logPrintf("%02X", frame[i]);
-  }
-
-  logPrintln();
-
-  processFrame(frame, expectedLen);
+  logPrintln("SHUT NOTIFY checksum: OK");
+  processShutNotifyFrame(frame, expectedLen);
   return true;
 }
 
@@ -599,12 +604,11 @@ bool receiveShutResponse(uint8_t *out, size_t outMax, size_t &outLen, uint32_t t
     if (!readShutByte(type, 50))
       continue;
 
-    // The UPS can send spontaneous TYPE-33/TYPE-44 frames while we are
-    // waiting for a GET_REPORT response. Consume them as complete frames
-    // instead of treating 0x85 as a SHUT packet type.
+    // The UPS can send spontaneous SHUT NOTIFY packets while a
+    // GET_REPORT response is pending. Consume the complete packet first.
     if (type == 0x85)
     {
-      consumeAsyncMgeFrame(type);
+      consumeAsyncShutNotify(type);
       continue;
     }
 
@@ -760,149 +764,134 @@ void pollShutTelemetry()
   }
 }
 
-// MGE parser
+// SHUT/HID notification parser
 // -----------------------------------------------------------------------------
 
-void processType33(const uint8_t *frame, uint8_t len)
+void updateUpsStateFromPresentStatus()
 {
-  lastType33Hex = frameToHex(frame, len);
-  lastType33ChecksumOk = checkChecksum(frame, len);
-  type33Count++;
-
-  if (!lastType33ChecksumOk)
+  if (!statusGood)
   {
-    upsStatus = "Checksum Fehler";
-    upsPower = "Unbekannt";
-    upsOperation = "Unbekannt";
+    upsStatus = "AUS";
+    upsPower = statusAcPresent ? "Netz vorhanden" : "Netz fehlt";
+    upsOperation = statusAcPresent ? "OFFLINE" : "OFFLINE / NETZAUSFALL";
     return;
   }
 
-  if (len == 6 &&
-      frame[0] == 0x85 &&
-      frame[1] == 0x33 &&
-      frame[2] == 0x02 &&
-      frame[3] == 0x23 &&
-      frame[4] == 0x00 &&
-      frame[5] == 0x21)
-  {
-    upsStatus = "EIN";
-    upsPower = "Netz vorhanden";
-    upsOperation = "ONLINE";
-  }
-  else if (len == 6 &&
-           frame[0] == 0x85 &&
-           frame[1] == 0x33 &&
-           frame[2] == 0x02 &&
-           frame[3] == 0x24 &&
-           frame[4] == 0x00 &&
-           frame[5] == 0x26)
-  {
-    upsStatus = "EIN";
-    upsPower = "Netz fehlt";
-    upsOperation = "BATTERIE";
-  }
-  else if (len == 6 &&
-           frame[0] == 0x85 &&
-           frame[1] == 0x33 &&
-           frame[2] == 0x02 &&
-           frame[3] == 0x03 &&
-           frame[4] == 0x00 &&
-           frame[5] == 0x01)
-  {
-    upsStatus = "AUS";
-    upsPower = "Netz vorhanden";
-    upsOperation = "OFFLINE";
-  }
-  else if (len == 6 &&
-           frame[0] == 0x85 &&
-           frame[1] == 0x33 &&
-           frame[2] == 0x02 &&
-           frame[3] == 0x00 &&
-           frame[4] == 0x00 &&
-           frame[5] == 0x02)
-  {
-    upsStatus = "AUS";
-    upsPower = "Netz fehlt";
-    upsOperation = "OFFLINE / NETZAUSFALL";
-  }
+  upsStatus = "EIN";
+  upsPower = statusAcPresent ? "Netz vorhanden" : "Netz fehlt";
+
+  if (statusAcPresent)
+    upsOperation = statusCharging ? "ONLINE / LADEN" : "ONLINE";
   else
-  {
-    upsStatus = "Unbekannter Status";
-    upsPower = "Unbekannt";
-    upsOperation = "Unbekannt";
-  }
+    upsOperation = statusDischarging ? "BATTERIE" : "NETZAUSFALL";
+
+  if (statusShutdownImminent)
+    upsOperation += " / SHUTDOWN IMMINENT";
+  if (statusBelowCapacityLimit)
+    upsOperation += " / BATTERIE NIEDRIG";
+  if (statusOverload)
+    upsOperation += " / OVERLOAD";
+  if (statusNeedReplacement)
+    upsOperation += " / BATTERIE TAUSCHEN";
+  if (statusInternalFailure)
+    upsOperation += " / INTERNER FEHLER";
 }
 
-void processType44(const uint8_t *frame, uint8_t len)
+void processPresentStatusReport(const uint8_t *frame, uint8_t len)
 {
-  lastType44Hex = frameToHex(frame, len);
-  lastType44ChecksumOk = checkChecksum(frame, len);
-  type44Count++;
+  lastPresentStatusHex = frameToHex(frame, len);
+  presentStatusChecksumOk = checkChecksum(frame, len);
+  presentStatusCount++;
 
-  if (!lastType44ChecksumOk)
+  if (!presentStatusChecksumOk || len < 6 || frame[2] != 0x02)
     return;
 
-  // Confirmed raw field layout:
-  //
-  // P0   = frame[2]
-  // P1   = frame[3]
-  // P2P3 = frame[4] | (frame[5] << 8)
-  //
-  // No physical interpretation here.
+  presentStatusBits =
+      static_cast<uint16_t>(frame[3]) |
+      (static_cast<uint16_t>(frame[4]) << 8);
 
-  type44P0 = frame[2];
-  type44P1 = frame[3];
-  type44P2P3 =
+  statusAcPresent          = presentStatusBits & (1u << 0);
+  statusCharging           = presentStatusBits & (1u << 1);
+  statusDischarging        = presentStatusBits & (1u << 2);
+  statusBelowCapacityLimit = presentStatusBits & (1u << 3);
+  statusNeedReplacement    = presentStatusBits & (1u << 4);
+  statusGood               = presentStatusBits & (1u << 5);
+  statusShutdownImminent   = presentStatusBits & (1u << 6);
+  statusOverload           = presentStatusBits & (1u << 7);
+  statusInternalFailure    = presentStatusBits & (1u << 8);
+
+  updateUpsStateFromPresentStatus();
+}
+
+void processBatteryReport(const uint8_t *frame, uint8_t len)
+{
+  lastBatteryReportHex = frameToHex(frame, len);
+  batteryReportChecksumOk = checkChecksum(frame, len);
+  batteryReportCount++;
+
+  if (!batteryReportChecksumOk || len < 7 || frame[2] != 0x16)
+    return;
+
+  shutCapacity = frame[3];
+  shutRuntimeSeconds =
       static_cast<uint16_t>(frame[4]) |
       (static_cast<uint16_t>(frame[5]) << 8);
 
-  // Store the latest TYPE-44 value in the circular RAM history.
-  Type44HistoryEntry &entry = type44History[type44HistoryNext];
+  shutTelemetryValid = true;
+
+  BatteryHistoryEntry &entry = batteryHistory[batteryHistoryNext];
   entry.millisAt = millis();
-  entry.p0 = type44P0;
-  entry.p1 = type44P1;
-  entry.p2p3 = type44P2P3;
+  entry.capacity = shutCapacity;
+  entry.runtimeSeconds = shutRuntimeSeconds;
 
-  type44HistoryNext =
-      (type44HistoryNext + 1) % TYPE44_HISTORY_SIZE;
+  batteryHistoryNext =
+      (batteryHistoryNext + 1) % BATTERY_HISTORY_SIZE;
 
-  if (type44HistoryCount < TYPE44_HISTORY_SIZE)
-    type44HistoryCount++;
+  if (batteryHistoryCount < BATTERY_HISTORY_SIZE)
+    batteryHistoryCount++;
 }
 
-void processFrame(const uint8_t *frame, uint8_t len)
+bool processShutNotifyFrame(const uint8_t *frame, uint8_t len)
 {
-  if (len < 2 || frame[0] != 0x85)
-    return;
+  if (len < 4 || frame[0] != 0x85)
+    return false;
 
-  switch (frame[1])
+  uint8_t payloadLen = frame[1] & 0x0F;
+
+  if ((frame[1] >> 4) != payloadLen ||
+      len != payloadLen + 3 ||
+      !checkChecksum(frame, len))
+    return false;
+
+  switch (frame[2])
   {
-    case 0x33:
-      if (len == 6)
-        processType33(frame, len);
-      break;
+    case 0x02:
+      processPresentStatusReport(frame, len);
+      return true;
 
-    case 0x44:
-      if (len == 7)
-        processType44(frame, len);
-      break;
+    case 0x16:
+      processBatteryReport(frame, len);
+      return true;
 
     default:
-      break;
+      logPrintf("SHUT NOTIFY: unhandled HID report 0x%02X\n", frame[2]);
+      return false;
   }
 }
 
 void feedMgeByte(uint8_t b)
 {
+  static uint8_t expectedFrameLen = 0;
+
   if (!rxInFrame)
   {
     if (b == 0x85)
     {
       rxInFrame = true;
       rxFrameLen = 0;
+      expectedFrameLen = 0;
       rxFrame[rxFrameLen++] = b;
     }
-
     return;
   }
 
@@ -910,38 +899,43 @@ void feedMgeByte(uint8_t b)
   {
     rxInFrame = false;
     rxFrameLen = 0;
+    expectedFrameLen = 0;
     return;
   }
 
   rxFrame[rxFrameLen++] = b;
 
-  if (rxFrameLen == 2 &&
-      rxFrame[1] != 0x33 &&
-      rxFrame[1] != 0x44)
+  if (rxFrameLen == 2)
   {
-    rxInFrame = false;
-    rxFrameLen = 0;
-    return;
+    uint8_t lenByte = rxFrame[1];
+
+    if ((lenByte >> 4) != (lenByte & 0x0F))
+    {
+      rxInFrame = false;
+      rxFrameLen = 0;
+      expectedFrameLen = 0;
+      return;
+    }
+
+    uint8_t payloadLen = lenByte & 0x0F;
+
+    if (payloadLen == 0 || payloadLen > 8)
+    {
+      rxInFrame = false;
+      rxFrameLen = 0;
+      expectedFrameLen = 0;
+      return;
+    }
+
+    expectedFrameLen = payloadLen + 3;
   }
 
-  if (rxFrameLen == 6 && rxFrame[1] == 0x33)
+  if (expectedFrameLen > 0 && rxFrameLen == expectedFrameLen)
   {
-    processFrame(rxFrame, rxFrameLen);
-
+    processShutNotifyFrame(rxFrame, rxFrameLen);
     rxInFrame = false;
     rxFrameLen = 0;
-
-    return;
-  }
-
-  if (rxFrameLen == 7 && rxFrame[1] == 0x44)
-  {
-    processFrame(rxFrame, rxFrameLen);
-
-    rxInFrame = false;
-    rxFrameLen = 0;
-
-    return;
+    expectedFrameLen = 0;
   }
 }
 
@@ -966,7 +960,6 @@ void readMgeSerial()
     received = true;
 
     feedMgeByte(b);
-
     logPrintf("%02X ", b);
   }
 
@@ -1067,38 +1060,58 @@ void handleUps()
   body += String(totalRxBytes);
   body += F("</td></tr>");
 
-  body += F("<tr><td>TYPE 33 Telegramme</td><td>");
-  body += String(type33Count);
+  body += F("<tr><td>HID Report 0x02 / PresentStatus</td><td>");
+  body += String(presentStatusCount);
   body += F("</td></tr>");
 
-  body += F("<tr><td>TYPE 44 Telegramme</td><td>");
-  body += String(type44Count);
+  body += F("<tr><td>HID Report 0x16 / Batterie</td><td>");
+  body += String(batteryReportCount);
   body += F("</td></tr>");
 
   body += F("</table>");
   body += F("</div>");
 
   // ---------------------------------------------------------------------------
-  // TYPE 33
+  // HID Report 0x02 / PresentStatus
   // ---------------------------------------------------------------------------
 
   body += F("<div class='card'>");
-  body += F("<h2>TYPE 33 – Status</h2>");
+  body += F("<h2>SHUT/HID 0x02 – PresentStatus</h2>");
 
-  if (lastType33Hex.length() == 0)
+  if (lastPresentStatusHex.length() == 0)
   {
-    body += F("<p>Noch kein TYPE-33-Telegramm empfangen.</p>");
+    body += F("<p>Noch kein PresentStatus-Report empfangen.</p>");
   }
   else
   {
     body += F("<pre>");
-    body += lastType33Hex;
+    body += lastPresentStatusHex;
     body += F("</pre>");
 
-    if (lastType33ChecksumOk)
+    if (presentStatusChecksumOk)
       body += F("<p class='ok'>Checksum: OK</p>");
     else
       body += F("<p class='bad'>Checksum: FEHLER</p>");
+
+    String statusHex = String(presentStatusBits, HEX);
+    statusHex.toUpperCase();
+    while (statusHex.length() < 4)
+      statusHex = "0" + statusHex;
+
+    body += F("<table>");
+    body += F("<tr><td>Statusbits</td><td>0x");
+    body += statusHex;
+    body += F("</td></tr>");
+    body += F("<tr><td>AC Present</td><td>"); body += statusAcPresent ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Charging</td><td>"); body += statusCharging ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Discharging</td><td>"); body += statusDischarging ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Below Capacity Limit</td><td>"); body += statusBelowCapacityLimit ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Need Replacement</td><td>"); body += statusNeedReplacement ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Good</td><td>"); body += statusGood ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Shutdown Imminent</td><td>"); body += statusShutdownImminent ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Overload</td><td>"); body += statusOverload ? "1" : "0"; body += F("</td></tr>");
+    body += F("<tr><td>Internal Failure</td><td>"); body += statusInternalFailure ? "1" : "0"; body += F("</td></tr>");
+    body += F("</table>");
   }
 
   body += F("</div>");
@@ -1134,138 +1147,87 @@ void handleUps()
     body += String(shutLoadPercent); body += F(" %");
   } else body += F("Unbekannt");
   body += F("</td></tr></table>");
-  body += F("<p><small>SHUT-Werte werden aktiv per GET REPORT abgefragt. Report 0x0E: Spannung + Last.</small></p></div>");
+  body += F("<p><small>SHUT-Werte werden aktiv per GET REPORT abgefragt. Report 0x0E: Spannung + Last; Report 0x16: Batterie + Restlaufzeit.</small></p></div>");
 
-  // TYPE 44
+  // ---------------------------------------------------------------------------
+  // HID Report 0x16 / Battery
   // ---------------------------------------------------------------------------
 
   body += F("<div class='card'>");
-  body += F("<h2>TYPE 44 – Telemetrie</h2>");
+  body += F("<h2>SHUT/HID 0x16 – Batterie</h2>");
 
-  if (lastType44Hex.length() == 0)
+  if (lastBatteryReportHex.length() == 0)
   {
-    body += F("<p>Noch kein TYPE-44-Telegramm empfangen.</p>");
+    body += F("<p>Noch kein Batterie-Report 0x16 empfangen.</p>");
   }
   else
   {
-    body += F("<table>");
+    body += F("<pre>");
+    body += lastBatteryReportHex;
+    body += F("</pre>");
 
-    body += F("<tr><td>Telegramm</td><td><code>");
-    body += lastType44Hex;
-    body += F("</code></td></tr>");
-
-    body += F("<tr><td>Checksum</td><td>");
-
-    if (lastType44ChecksumOk)
-      body += F("<span class='ok'>OK</span>");
+    if (batteryReportChecksumOk)
+      body += F("<p class='ok'>Checksum: OK</p>");
     else
-      body += F("<span class='bad'>FEHLER</span>");
+      body += F("<p class='bad'>Checksum: FEHLER</p>");
 
-    body += F("</td></tr>");
-
-    body += F("<tr><td>P0</td><td>0x");
-    body += hexByte(type44P0);
-    body += F(" (");
-    body += String(type44P0);
-    body += F(")</td></tr>");
-
-    body += F("<tr><td>P1</td><td>0x");
-    body += hexByte(type44P1);
-    body += F(" (");
-    body += String(type44P1);
-    body += F(")</td></tr>");
-
-    body += F("<tr><td>P2P3</td><td>0x");
-
-    String p2p3Hex;
-    if (type44P2P3 < 0x1000)
-      p2p3Hex += "0";
-
-    if (type44P2P3 < 0x100)
-      p2p3Hex += "0";
-
-    if (type44P2P3 < 0x10)
-      p2p3Hex += "0";
-
-    p2p3Hex += String(type44P2P3, HEX);
-    p2p3Hex.toUpperCase();
-
-    body += p2p3Hex;
-
-    body += F(" (");
-    body += String(type44P2P3);
-    body += F(")</td></tr>");
-
-    body += F("</table>");
-
-    body += F(
-      "<p><small>"
-      "Die Felder werden absichtlich nicht als Spannung, "
-      "Last, Laufzeit oder Prozentwert interpretiert."
-      "</small></p>"
-    );
+    body += F("<table><tr><td>Remaining Capacity</td><td>");
+    body += String(shutCapacity);
+    body += F(" %</td></tr><tr><td>Run Time To Empty</td><td>");
+    body += String(shutRuntimeSeconds / 60);
+    body += F(":");
+    if ((shutRuntimeSeconds % 60) < 10)
+      body += F("0");
+    body += String(shutRuntimeSeconds % 60);
+    body += F(" min</td></tr></table>");
   }
 
   body += F("</div>");
 
   // ---------------------------------------------------------------------------
-  // TYPE 44 history
+  // Battery history
   // ---------------------------------------------------------------------------
 
   body += F("<div class='card'>");
-  body += F("<h2>TYPE 44 – Verlauf</h2>");
+  body += F("<h2>Batterie – Verlauf</h2>");
 
-  if (type44HistoryCount == 0)
+  if (batteryHistoryCount == 0)
   {
-    body += F("<p>Noch kein TYPE-44-Verlauf vorhanden.</p>");
+    body += F("<p>Noch kein Verlauf vorhanden.</p>");
   }
   else
   {
-    body += F("<table><tr><th>Zeit</th><th>P1</th><th>P2P3</th></tr>");
+    body += F("<table><tr><th>Zeit</th><th>Kapazität</th><th>Restlaufzeit</th></tr>");
 
-    uint8_t oldestIndex;
+    uint8_t oldestIndex =
+        (batteryHistoryCount < BATTERY_HISTORY_SIZE) ? 0 : batteryHistoryNext;
 
-    if (type44HistoryCount < TYPE44_HISTORY_SIZE)
-      oldestIndex = 0;
-    else
-      oldestIndex = type44HistoryNext;
-
-    for (uint8_t i = 0; i < type44HistoryCount; i++)
+    for (uint8_t i = 0; i < batteryHistoryCount; i++)
     {
       uint8_t index =
-          (oldestIndex + i) % TYPE44_HISTORY_SIZE;
+          (oldestIndex + i) % BATTERY_HISTORY_SIZE;
 
-      const Type44HistoryEntry &entry = type44History[index];
-
+      const BatteryHistoryEntry &entry = batteryHistory[index];
       unsigned long ageSeconds =
           (millis() - entry.millisAt) / 1000;
 
-      String p2p3Hex;
-
-      if (entry.p2p3 < 0x1000) p2p3Hex += "0";
-      if (entry.p2p3 < 0x100)  p2p3Hex += "0";
-      if (entry.p2p3 < 0x10)   p2p3Hex += "0";
-
-      p2p3Hex += String(entry.p2p3, HEX);
-      p2p3Hex.toUpperCase();
-
-      body += F("<tr><td>vor " );
+      body += F("<tr><td>vor ");
       body += String(ageSeconds);
-      body += F(" s</td><td>0x");
-      body += hexByte(entry.p1);
-      body += F(" (");
-      body += String(entry.p1);
-      body += F(")</td><td>0x");
-      body += p2p3Hex;
-      body += F(" (");
-      body += String(entry.p2p3);
-      body += F(")</td></tr>");
+      body += F(" s</td><td>");
+      body += String(entry.capacity);
+      body += F(" %</td><td>");
+      body += String(entry.runtimeSeconds / 60);
+      body += F(":");
+      if ((entry.runtimeSeconds % 60) < 10)
+        body += F("0");
+      body += String(entry.runtimeSeconds % 60);
+      body += F(" min</td></tr>");
     }
 
     body += F("</table>");
   }
 
-  body += F("<p><small>Letzte 30 gültigen TYPE-44-Telegramme. Verlauf liegt nur im RAM und wird beim Neustart gelöscht.</small></p>");
+  body += F("<p><small>Letzte 30 gültigen HID-Reports 0x16. Verlauf liegt nur im RAM und wird beim Neustart gelöscht.</small></p>");
   body += F("</div>");
 
   // ---------------------------------------------------------------------------
