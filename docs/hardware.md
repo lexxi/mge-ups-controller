@@ -47,3 +47,20 @@ The known working sequence is:
 6. Release FLASH once the programmer responds.
 
 Do not run esptool chip-id immediately before using the NodeMCU programmer. esptool performs a hard reset via RTS afterwards, which leaves the ESP8266 bootloader and can prevent the programmer from getting its ACK.
+
+
+## Test setup and UPS connection
+
+The following photos document the actual hardware setup used during SHUT/HID reverse engineering and control testing.
+
+### UPS board connection
+
+![MGE Ellipse UPS board serial connection](images/ups-board-connection.jpg)
+
+Serial connection at the UPS controller board used for the SHUT interface tests.
+
+### ESP8266 test setup
+
+![ESP8266 and isolated serial test setup](images/esp8266-test-setup.jpg)
+
+LOLIN/WEMOS D1 mini test setup with the isolated serial interface connected to the MGE Ellipse UPS.
