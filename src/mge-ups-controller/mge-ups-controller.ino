@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.10.0";
+static const char *APP_VERSION = "0.11.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -1586,6 +1586,199 @@ void handleApiHidSetReport()
   server.send(ok ? 200 : 503, "application/json; charset=utf-8", json);
 }
 
+
+bool getShutFeatureReport(uint8_t reportId,
+                          uint8_t *response,
+                          size_t responseMax,
+                          size_t &responseLen,
+                          size_t requestedLen)
+{
+  responseLen = 0;
+
+  if (!syncShut())
+    return false;
+
+  clearShutRx();
+  sendShutGetReport(reportId);
+
+  return receiveShutResponse(response,
+                             responseMax,
+                             responseLen,
+                             3000);
+}
+
+bool setDelayReport(uint8_t reportId, int32_t rawValue)
+{
+  uint8_t payload[4];
+  payload[0] = reportId;
+  payload[1] = (uint8_t)(rawValue & 0xFF);
+  payload[2] = (uint8_t)((rawValue >> 8) & 0xFF);
+  payload[3] = (uint8_t)((rawValue >> 16) & 0xFF);
+
+  return setShutReport(reportId, payload, sizeof(payload));
+}
+
+int32_t decodeSigned24(const uint8_t *p)
+{
+  int32_t value =
+      (int32_t)p[0] |
+      ((int32_t)p[1] << 8) |
+      ((int32_t)p[2] << 16);
+
+  if (value & 0x00800000)
+    value |= 0xFF000000;
+
+  return value;
+}
+
+void sendControlResult(bool ok,
+                       const char *action,
+                       long requestedSeconds,
+                       int32_t rawValue)
+{
+  String json;
+  json.reserve(320);
+
+  json += F("{\"ok\":");
+  json += jsonBool(ok);
+  json += F(",\"action\":\"");
+  json += action;
+  json += F("\",\"requested_seconds\":");
+  json += String(requestedSeconds);
+  json += F(",\"raw_value\":");
+  json += String(rawValue);
+  json += F("}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(ok ? 200 : 503,
+              "application/json; charset=utf-8",
+              json);
+}
+
+void handleApiControlShutdown()
+{
+  if (!server.hasArg("delay"))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"missing delay\"}");
+    return;
+  }
+
+  long seconds = server.arg("delay").toInt();
+
+  if (seconds < 0 || seconds > 8388607L)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"delay out of range\"}");
+    return;
+  }
+
+  bool ok = setDelayReport(0x0F, (int32_t)seconds);
+  sendControlResult(ok, "shutdown", seconds, (int32_t)seconds);
+}
+
+void handleApiControlStartup()
+{
+  if (!server.hasArg("delay"))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"missing delay\"}");
+    return;
+  }
+
+  long seconds = server.arg("delay").toInt();
+
+  if (seconds < 0 || seconds > 83886070L)
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"delay out of range\"}");
+    return;
+  }
+
+  // Report 0x11 has HID Unit Exponent +1: one raw unit = 10 seconds.
+  long raw = (seconds + 9L) / 10L;
+
+  if (raw > 8388607L)
+    raw = 8388607L;
+
+  bool ok = setDelayReport(0x11, (int32_t)raw);
+  sendControlResult(ok, "startup", seconds, (int32_t)raw);
+}
+
+void handleApiControlShutdownCancel()
+{
+  bool ok = setDelayReport(0x0F, -1);
+  sendControlResult(ok, "shutdown_cancel", -1, -1);
+}
+
+void handleApiControlStartupCancel()
+{
+  bool ok = setDelayReport(0x11, -1);
+  sendControlResult(ok, "startup_cancel", -1, -1);
+}
+
+void handleApiControlStatus()
+{
+  uint8_t shutdownReport[8];
+  uint8_t startupReport[8];
+  size_t shutdownLen = 0;
+  size_t startupLen = 0;
+
+  bool shutdownOk =
+      getShutFeatureReport(0x0F,
+                           shutdownReport,
+                           sizeof(shutdownReport),
+                           shutdownLen,
+                           4);
+
+  bool startupOk =
+      getShutFeatureReport(0x11,
+                           startupReport,
+                           sizeof(startupReport),
+                           startupLen,
+                           4);
+
+  int32_t shutdownRaw = -1;
+  int32_t startupRaw = -1;
+
+  if (shutdownOk && shutdownLen >= 4 && shutdownReport[0] == 0x0F)
+    shutdownRaw = decodeSigned24(&shutdownReport[1]);
+
+  if (startupOk && startupLen >= 4 && startupReport[0] == 0x11)
+    startupRaw = decodeSigned24(&startupReport[1]);
+
+  String json;
+  json.reserve(420);
+
+  json += F("{\"ok\":");
+  json += jsonBool(shutdownOk && startupOk);
+
+  json += F(",\"shutdown\":{\"raw\":");
+  json += String(shutdownRaw);
+  json += F(",\"seconds\":");
+  if (shutdownRaw >= 0)
+    json += String(shutdownRaw);
+  else
+    json += F("null");
+  json += F("}");
+
+  json += F(",\"startup\":{\"raw\":");
+  json += String(startupRaw);
+  json += F(",\"seconds\":");
+  if (startupRaw >= 0)
+    json += String((long)startupRaw * 10L);
+  else
+    json += F("null");
+  json += F("}");
+
+  json += F("}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send((shutdownOk && startupOk) ? 200 : 503,
+              "application/json; charset=utf-8",
+              json);
+}
+
 void handleApiHidReportDescriptor()
 {
   uint8_t hidDescriptor[9];
@@ -1725,6 +1918,9 @@ void handleRoot()
     "<p><a href='/api/hid/report-descriptor'>HID Report Descriptor (JSON)</a></p>"
     "<p>Engineering API: /api/hid/get?id=0E&amp;len=3</p>"
     "<p>Write API: /api/hid/set?id=XX&amp;data=..&amp;confirm=YES</p>"
+    "<p>Control API: /api/control/status</p>"
+    "<p>POST /api/control/shutdown?delay=30</p>"
+    "<p>POST /api/control/startup?delay=300</p>"
     "<p><a href='/logs'>System Logs</a></p>"
     "</div>"
   );
@@ -2192,6 +2388,11 @@ void setup()
   server.on("/api/hid/report-descriptor", HTTP_GET, handleApiHidReportDescriptor);
   server.on("/api/hid/get", HTTP_GET, handleApiHidGetReport);
   server.on("/api/hid/set", HTTP_POST, handleApiHidSetReport);
+  server.on("/api/control/status", HTTP_GET, handleApiControlStatus);
+  server.on("/api/control/shutdown", HTTP_POST, handleApiControlShutdown);
+  server.on("/api/control/startup", HTTP_POST, handleApiControlStartup);
+  server.on("/api/control/shutdown/cancel", HTTP_POST, handleApiControlShutdownCancel);
+  server.on("/api/control/startup/cancel", HTTP_POST, handleApiControlStartupCancel);
   server.on("/logs", HTTP_GET, handleLogs);
   server.on("/logs/download", HTTP_GET, handleLogDownload);
   server.on("/logs/clear", HTTP_GET, handleLogClear);
