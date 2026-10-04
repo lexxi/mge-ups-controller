@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.9.1";
+static const char *APP_VERSION = "0.9.2";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -1183,38 +1183,81 @@ void handleApiStatus()
 
 void handleApiHidReportDescriptor()
 {
-  static const size_t MAX_DESCRIPTOR = 512;
-  uint8_t descriptor[MAX_DESCRIPTOR];
-  size_t descriptorLen = 0;
+  uint8_t hidDescriptor[9];
+  size_t hidDescriptorLen = 0;
 
-  bool ok = getShutDescriptor(
-      0x22,                 // HID report descriptor
-      descriptor,
-      sizeof(descriptor),
-      descriptorLen,
-      MAX_DESCRIPTOR);
+  bool hidOk = getShutDescriptor(
+      0x21,                 // HID descriptor
+      hidDescriptor,
+      sizeof(hidDescriptor),
+      hidDescriptorLen,
+      sizeof(hidDescriptor));
+
+  uint16_t reportedReportLength = 0;
+
+  if (hidOk && hidDescriptorLen >= 9)
+  {
+    reportedReportLength =
+        static_cast<uint16_t>(hidDescriptor[7]) |
+        (static_cast<uint16_t>(hidDescriptor[8]) << 8);
+  }
+
+  static const size_t MAX_REPORT_DESCRIPTOR = 768;
+  uint8_t reportDescriptor[MAX_REPORT_DESCRIPTOR];
+  size_t reportDescriptorLen = 0;
+
+  bool reportOk = false;
+
+  if (hidOk &&
+      reportedReportLength > 0 &&
+      reportedReportLength <= MAX_REPORT_DESCRIPTOR)
+  {
+    reportOk = getShutDescriptor(
+        0x22,                 // HID report descriptor
+        reportDescriptor,
+        sizeof(reportDescriptor),
+        reportDescriptorLen,
+        reportedReportLength);
+  }
 
   String json;
-  json.reserve(descriptorLen * 3 + 256);
+  json.reserve(reportDescriptorLen * 3 + 512);
 
   json += F("{\"ok\":");
-  json += jsonBool(ok);
-  json += F(",\"descriptor_type\":\"0x22\",\"length\":");
-  json += String(descriptorLen);
-  json += F(",\"hex\":\"");
+  json += jsonBool(hidOk && reportOk);
+  json += F(",\"hid_descriptor_length\":");
+  json += String(hidDescriptorLen);
+  json += F(",\"reported_report_descriptor_length\":");
+  if (reportedReportLength > 0)
+    json += String(reportedReportLength);
+  else
+    json += F("null");
 
-  for (size_t i = 0; i < descriptorLen; i++)
+  json += F(",\"received_report_descriptor_length\":");
+  json += String(reportDescriptorLen);
+
+  json += F(",\"hid_descriptor_hex\":\"");
+  for (size_t i = 0; i < hidDescriptorLen; i++)
   {
     if (i > 0)
       json += " ";
-
-    json += hexByte(descriptor[i]);
+    json += hexByte(hidDescriptor[i]);
   }
+  json += F("\"");
 
+  json += F(",\"report_descriptor_hex\":\"");
+  for (size_t i = 0; i < reportDescriptorLen; i++)
+  {
+    if (i > 0)
+      json += " ";
+    json += hexByte(reportDescriptor[i]);
+  }
   json += F("\"}");
 
   server.sendHeader("Cache-Control", "no-store");
-  server.send(ok ? 200 : 503, "application/json; charset=utf-8", json);
+  server.send((hidOk && reportOk) ? 200 : 503,
+              "application/json; charset=utf-8",
+              json);
 }
 
 void handleApiHealth()
