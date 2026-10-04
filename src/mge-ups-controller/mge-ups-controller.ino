@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.12.0";
+static const char *APP_VERSION = "0.12.1";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -2236,7 +2236,6 @@ void handleUps()
 
 void handleLogs()
 {
-  // Never let the browser cache an old log page.
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
@@ -2249,48 +2248,72 @@ void handleLogs()
     return;
   }
 
-  String body;
-  body.reserve(16000);
-
   size_t size = file.size();
 
-  // Keep the web page responsive; full log remains available via download.
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html; charset=utf-8", "");
+
+  String header;
+  header.reserve(1200);
+  header += F("<!doctype html><html><head><meta charset='utf-8'>");
+  header += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
+  header += F("<title>MGE Logs</title>");
+  header += F("<style>body{font-family:Arial;max-width:1000px;margin:20px auto;padding:0 15px}");
+  header += F("pre{background:#111;color:#ddd;padding:15px;white-space:pre-wrap;overflow:auto}");
+  header += F("a,button{display:inline-block;padding:9px 14px;margin:4px}</style></head><body>");
+  header += F("<h1>System Log</h1><p>Firmware: v");
+  header += APP_VERSION;
+  header += F(" | Datei: ");
+  header += String(size);
+  header += F(" Bytes</p>");
+  header += F("<p><a href='/logs/download'>Log herunterladen</a>");
+  header += F("<a href='/logs/clear' onclick=\"return confirm('Log wirklich löschen?')\">Log löschen</a>");
+  header += F("<a href='/'>Zurück</a></p><pre id='log'>");
+
+  server.sendContent(header);
+
   if (size > 16000)
   {
     file.seek(size - 16000, SeekSet);
-    body = "[... log gekürzt; vollständiger Log über Download ...]\\n";
+    server.sendContent(F("[... log gekürzt; vollständiger Log über Download ...]\n"));
   }
 
+  String chunk;
+  chunk.reserve(768);
+
   while (file.available())
-    body += file.readStringUntil('\n') + "\n";
+  {
+    char c = (char)file.read();
+
+    if (c == '&')
+      chunk += F("&amp;");
+    else if (c == '<')
+      chunk += F("&lt;");
+    else if (c == '>')
+      chunk += F("&gt;");
+    else
+      chunk += c;
+
+    if (chunk.length() >= 512)
+    {
+      server.sendContent(chunk);
+      chunk = "";
+      yield();
+    }
+  }
 
   file.close();
 
-  String page;
-  page.reserve(body.length() + 1500);
-  page += "<!doctype html><html><head><meta charset='utf-8'>";
-  page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  page += "<title>MGE Logs</title>";
-  page += "<style>body{font-family:Arial;max-width:1000px;margin:20px auto;padding:0 15px}";
-  page += "pre{background:#111;color:#ddd;padding:15px;white-space:pre-wrap;overflow:auto}";
-  page += "a,button{display:inline-block;padding:9px 14px;margin:4px}</style></head><body>";
-  page += "<h1>System Log</h1>";
-  page += "<p>Firmware: v";
-  page += APP_VERSION;
-  page += " | Datei: ";
-  page += String(size);
-  page += " Bytes</p>";
-  page += "<p><a href='/logs/download'>Log herunterladen</a>";
-  page += "<a href='/logs/clear' onclick=\"return confirm('Log wirklich löschen?')\">Log löschen</a>";
-  page += "<a href='/'>Zurück</a></p>";
-  page += "<pre id='log'>";
-  page += body;
-  page += "</pre>";
-  page += "<script>";
-  page += "setTimeout(function(){ location.reload(); }, 2000);";
-  page += "</script></body></html>";
+  if (chunk.length() > 0)
+    server.sendContent(chunk);
 
-  server.send(200, "text/html; charset=utf-8", page);
+  server.sendContent(
+    F("</pre><script>"
+      "setTimeout(function(){location.reload();},2000);"
+      "</script></body></html>")
+  );
+
+  server.sendContent("");
 }
 
 void handleLogDownload()
@@ -2404,11 +2427,6 @@ void setup()
 
   delay(300);
 
-  logPrintln();
-  logPrint("MGE UPS Controller v");
-  logPrintln(APP_VERSION);
-  logPrintln("----------------------");
-
   if (!LittleFS.begin())
   {
     Serial.println("LittleFS mount failed");
@@ -2417,6 +2435,11 @@ void setup()
   {
     initLogger();
   }
+
+  logPrintln();
+  logPrint("MGE UPS Controller v");
+  logPrintln(APP_VERSION);
+  logPrintln("----------------------");
 
   mgeSerial.begin(2400);
 
