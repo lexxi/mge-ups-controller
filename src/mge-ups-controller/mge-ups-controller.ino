@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.9.4";
+static const char *APP_VERSION = "0.10.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -1300,6 +1300,292 @@ void handleApiStatus()
   server.send(200, "application/json; charset=utf-8", json);
 }
 
+
+bool parseHexByteString(const String &input, uint8_t *out, size_t outMax, size_t &outLen)
+{
+  outLen = 0;
+  String token;
+
+  for (size_t i = 0; i <= input.length(); i++)
+  {
+    char c = (i < input.length()) ? input[i] : ' ';
+
+    if (c == ' ' || c == ':' || c == ',' || c == ';' || c == '-')
+    {
+      if (token.length() == 0)
+        continue;
+
+      if (token.length() > 2 || outLen >= outMax)
+        return false;
+
+      char *endptr = nullptr;
+      long value = strtol(token.c_str(), &endptr, 16);
+
+      if (*endptr != '\0' || value < 0 || value > 255)
+        return false;
+
+      out[outLen++] = (uint8_t)value;
+      token = "";
+    }
+    else
+    {
+      if (!isxdigit((unsigned char)c))
+        return false;
+
+      token += c;
+    }
+  }
+
+  return outLen > 0;
+}
+
+bool sendShutPacket(uint8_t type, const uint8_t *payload, size_t payloadLen)
+{
+  if (payloadLen == 0 || payloadLen > 8)
+    return false;
+
+  uint8_t lenByte = ((uint8_t)payloadLen << 4) | (uint8_t)payloadLen;
+  uint8_t checksum = shutChecksum(payload, payloadLen);
+
+  mgeSerial.write(type);
+  mgeSerial.write(lenByte);
+  mgeSerial.write(payload, payloadLen);
+  mgeSerial.write(checksum);
+  mgeSerial.flush();
+
+  return true;
+}
+
+bool waitForShutAck(uint32_t timeoutMs)
+{
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs)
+  {
+    uint8_t b;
+
+    if (!readShutByte(b, 50))
+      continue;
+
+    if (b == 0x06)
+      return true;
+
+    if (b == 0x15)
+      return false;
+
+    if (b == 0x85)
+    {
+      consumeAsyncShutNotify(b);
+      continue;
+    }
+  }
+
+  return false;
+}
+
+bool setShutReport(uint8_t reportId,
+                   const uint8_t *report,
+                   size_t reportLen)
+{
+  if (reportLen == 0 || reportLen > 8)
+    return false;
+
+  if (!syncShut())
+  {
+    logPrintln("SHUT SET REPORT: sync failed");
+    return false;
+  }
+
+  clearShutRx();
+
+  uint8_t setup[8] = {
+    0x21,                              // bmRequestType: SET_REPORT
+    0x09,                              // bRequest: SET_REPORT
+    reportId,                          // wValue LSB: report ID
+    0x03,                              // wValue MSB: FEATURE report
+    0x00, 0x00,                        // wIndex
+    (uint8_t)(reportLen & 0xFF),
+    (uint8_t)(reportLen >> 8)
+  };
+
+  // First SHUT packet: request, not LAST.
+  if (!sendShutPacket(0x01, setup, sizeof(setup)))
+    return false;
+
+  if (!waitForShutAck(1500))
+  {
+    logPrintln("SHUT SET REPORT: setup not acknowledged");
+    return false;
+  }
+
+  // Second SHUT packet: actual report data, LAST request packet.
+  if (!sendShutPacket(0x81, report, reportLen))
+    return false;
+
+  if (!waitForShutAck(1500))
+  {
+    logPrintln("SHUT SET REPORT: data not acknowledged");
+    return false;
+  }
+
+  logPrintf("SHUT SET REPORT: report=0x%02X len=%u OK\n",
+            reportId, (unsigned int)reportLen);
+
+  return true;
+}
+
+bool parseHexArgByte(const String &value, uint8_t &out)
+{
+  if (value.length() == 0 || value.length() > 4)
+    return false;
+
+  String v = value;
+
+  if (v.startsWith("0x") || v.startsWith("0X"))
+    v = v.substring(2);
+
+  if (v.length() == 0 || v.length() > 2)
+    return false;
+
+  for (size_t i = 0; i < v.length(); i++)
+    if (!isxdigit((unsigned char)v[i]))
+      return false;
+
+  out = (uint8_t)strtoul(v.c_str(), nullptr, 16);
+  return true;
+}
+
+void handleApiHidGetReport()
+{
+  if (!server.hasArg("id"))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"missing id\"}");
+    return;
+  }
+
+  uint8_t reportId;
+
+  if (!parseHexArgByte(server.arg("id"), reportId))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"invalid id\"}");
+    return;
+  }
+
+  size_t requestedLen = 8;
+
+  if (server.hasArg("len"))
+  {
+    long n = server.arg("len").toInt();
+
+    if (n < 1 || n > 8)
+    {
+      server.send(400, "application/json",
+                  "{\"ok\":false,\"error\":\"len must be 1..8\"}");
+      return;
+    }
+
+    requestedLen = (size_t)n;
+  }
+
+  uint8_t response[8];
+  size_t responseLen = 0;
+
+  bool ok = false;
+
+  if (syncShut())
+  {
+    clearShutRx();
+    sendShutGetReport(reportId);
+    ok = receiveShutResponse(response, sizeof(response),
+                             responseLen, 3000);
+  }
+
+  String json;
+  json.reserve(256);
+  json += F("{\"ok\":");
+  json += jsonBool(ok);
+  json += F(",\"report_id\":\"0x");
+  json += hexByte(reportId);
+  json += F("\",\"requested_length\":");
+  json += String(requestedLen);
+  json += F(",\"received_length\":");
+  json += String(responseLen);
+  json += F(",\"hex\":\"");
+
+  for (size_t i = 0; i < responseLen; i++)
+  {
+    if (i > 0) json += " ";
+    json += hexByte(response[i]);
+  }
+
+  json += F("\"}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(ok ? 200 : 503, "application/json; charset=utf-8", json);
+}
+
+void handleApiHidSetReport()
+{
+  if (!server.hasArg("confirm") || server.arg("confirm") != "YES")
+  {
+    server.send(403, "application/json",
+                "{\"ok\":false,\"error\":\"write requires confirm=YES\"}");
+    return;
+  }
+
+  if (!server.hasArg("id") || !server.hasArg("data"))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"missing id or data\"}");
+    return;
+  }
+
+  uint8_t reportId;
+
+  if (!parseHexArgByte(server.arg("id"), reportId))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"invalid id\"}");
+    return;
+  }
+
+  uint8_t payload[8];
+  size_t payloadLen = 0;
+
+  if (!parseHexByteString(server.arg("data"),
+                          payload, sizeof(payload), payloadLen))
+  {
+    server.send(400, "application/json",
+                "{\"ok\":false,\"error\":\"invalid hex data; max 8 bytes\"}");
+    return;
+  }
+
+  bool ok = setShutReport(reportId, payload, payloadLen);
+
+  String json;
+  json.reserve(256);
+  json += F("{\"ok\":");
+  json += jsonBool(ok);
+  json += F(",\"report_id\":\"0x");
+  json += hexByte(reportId);
+  json += F("\",\"length\":");
+  json += String(payloadLen);
+  json += F(",\"hex\":\"");
+
+  for (size_t i = 0; i < payloadLen; i++)
+  {
+    if (i > 0) json += " ";
+    json += hexByte(payload[i]);
+  }
+
+  json += F("\"}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(ok ? 200 : 503, "application/json; charset=utf-8", json);
+}
+
 void handleApiHidReportDescriptor()
 {
   uint8_t hidDescriptor[9];
@@ -1437,6 +1723,8 @@ void handleRoot()
     "<p><a href='/api/status'>API Status (JSON)</a></p>"
     "<p><a href='/api/health'>API Health (JSON)</a></p>"
     "<p><a href='/api/hid/report-descriptor'>HID Report Descriptor (JSON)</a></p>"
+    "<p>Engineering API: /api/hid/get?id=0E&amp;len=3</p>"
+    "<p>Write API: /api/hid/set?id=XX&amp;data=..&amp;confirm=YES</p>"
     "<p><a href='/logs'>System Logs</a></p>"
     "</div>"
   );
@@ -1902,6 +2190,8 @@ void setup()
   server.on("/api/status", HTTP_GET, handleApiStatus);
   server.on("/api/health", HTTP_GET, handleApiHealth);
   server.on("/api/hid/report-descriptor", HTTP_GET, handleApiHidReportDescriptor);
+  server.on("/api/hid/get", HTTP_GET, handleApiHidGetReport);
+  server.on("/api/hid/set", HTTP_POST, handleApiHidSetReport);
   server.on("/logs", HTTP_GET, handleLogs);
   server.on("/logs/download", HTTP_GET, handleLogDownload);
   server.on("/logs/clear", HTTP_GET, handleLogClear);
