@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D6
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.8.1";
+static const char *APP_VERSION = "0.9.0";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -1000,6 +1000,147 @@ void readMgeSerial()
 // Web
 // -----------------------------------------------------------------------------
 
+String jsonBool(bool value)
+{
+  return value ? "true" : "false";
+}
+
+String jsonEscape(const String &value)
+{
+  String out;
+  out.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); i++)
+  {
+    char c = value[i];
+
+    switch (c)
+    {
+      case '\\': out += "\\\\"; break;
+      case '"':  out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if ((uint8_t)c >= 0x20)
+          out += c;
+        break;
+    }
+  }
+
+  return out;
+}
+
+void handleApiStatus()
+{
+  String json;
+  json.reserve(2200);
+
+  json += F("{");
+  json += F("\"version\":\"");
+  json += APP_VERSION;
+  json += F("\",");
+
+  json += F("\"ups\":{");
+  json += F("\"status\":\"");
+  json += jsonEscape(upsStatus);
+  json += F("\",");
+  json += F("\"power\":\"");
+  json += jsonEscape(upsPower);
+  json += F("\",");
+  json += F("\"operation\":\"");
+  json += jsonEscape(upsOperation);
+  json += F("\",");
+  json += F("\"ac_present\":");
+  json += jsonBool(statusAcPresent);
+  json += F(",\"charging\":");
+  json += jsonBool(statusCharging);
+  json += F(",\"discharging\":");
+  json += jsonBool(statusDischarging);
+  json += F(",\"below_capacity_limit\":");
+  json += jsonBool(statusBelowCapacityLimit);
+  json += F(",\"need_replacement\":");
+  json += jsonBool(statusNeedReplacement);
+  json += F(",\"good\":");
+  json += jsonBool(statusGood);
+  json += F(",\"shutdown_imminent\":");
+  json += jsonBool(statusShutdownImminent);
+  json += F(",\"overload\":");
+  json += jsonBool(statusOverload);
+  json += F(",\"internal_failure\":");
+  json += jsonBool(statusInternalFailure);
+  json += F("},");
+
+  json += F("\"telemetry\":{");
+  json += F("\"valid\":");
+  json += jsonBool(shutTelemetryValid);
+  json += F(",\"battery_percent\":");
+  if (shutTelemetryValid) json += String(shutCapacity); else json += F("null");
+  json += F(",\"runtime_seconds\":");
+  if (shutTelemetryValid) json += String(shutRuntimeSeconds); else json += F("null");
+  json += F(",\"input_voltage\":");
+  if (shutVoltageValid) json += String(shutVoltage); else json += F("null");
+  json += F(",\"load_percent\":");
+  if (shutVoltageValid) json += String(shutLoadPercent); else json += F("null");
+  json += F("},");
+
+  json += F("\"communication\":{");
+  json += F("\"protocol\":\"SHUT\",");
+  json += F("\"baud\":2400,");
+  json += F("\"rx_pin\":\"D5\",");
+  json += F("\"tx_pin\":\"D6\",");
+  json += F("\"rx_bytes\":");
+  json += String(totalRxBytes);
+  json += F(",\"present_status_reports\":");
+  json += String(presentStatusCount);
+  json += F(",\"battery_reports\":");
+  json += String(batteryReportCount);
+  json += F(",\"last_rx_age_ms\":");
+  if (lastRxMillis > 0)
+    json += String(millis() - lastRxMillis);
+  else
+    json += F("null");
+  json += F("},");
+
+  json += F("\"system\":{");
+  json += F("\"uptime_ms\":");
+  json += String(millis());
+  json += F(",\"wifi_connected\":");
+  json += jsonBool(WiFi.status() == WL_CONNECTED);
+  json += F(",\"ap_mode\":");
+  json += jsonBool(apMode);
+  json += F("}");
+
+  json += F("}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleApiHealth()
+{
+  bool commOk = shutTelemetryValid || presentStatusCount > 0;
+
+  String json;
+  json.reserve(256);
+
+  json += F("{\"ok\":");
+  json += jsonBool(commOk);
+  json += F(",\"version\":\"");
+  json += APP_VERSION;
+  json += F("\",\"uptime_ms\":");
+  json += String(millis());
+  json += F(",\"last_rx_age_ms\":");
+  if (lastRxMillis > 0)
+    json += String(millis() - lastRxMillis);
+  else
+    json += F("null");
+  json += F("}");
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(commOk ? 200 : 503, "application/json; charset=utf-8", json);
+}
+
 void handleRoot()
 {
   String body;
@@ -1031,6 +1172,8 @@ void handleRoot()
     "<p>Interface: 2400 Baud / 8N1</p>"
     "<p>RX: D5 &nbsp;&nbsp; TX: D6</p>"
     "<p><a href='/ups'>USV Monitor</a></p>"
+    "<p><a href='/api/status'>API Status (JSON)</a></p>"
+    "<p><a href='/api/health'>API Health (JSON)</a></p>"
     "<p><a href='/logs'>System Logs</a></p>"
     "</div>"
   );
@@ -1493,6 +1636,8 @@ void setup()
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/ups", HTTP_GET, handleUps);
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/health", HTTP_GET, handleApiHealth);
   server.on("/logs", HTTP_GET, handleLogs);
   server.on("/logs/download", HTTP_GET, handleLogDownload);
   server.on("/logs/clear", HTTP_GET, handleLogClear);
