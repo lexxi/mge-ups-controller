@@ -8,8 +8,8 @@ Target board: LOLIN/WEMOS D1 mini (ESP8266).
 
 Current test sketch uses:
 
-- D5: RX
-- D6: TX
+- D6: RX
+- D5: TX
 - 2400 baud
 - 8 data bits
 - no parity
