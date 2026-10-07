@@ -2308,9 +2308,9 @@ void handleLogs()
     server.sendContent(chunk);
 
   server.sendContent(
-    F("</pre><script>"
-      "setTimeout(function(){location.reload();},2000);"
-      "</script></body></html>")
+    F("</pre>"
+      "<p><button type='button' onclick='location.reload()'>Refresh</button></p>"
+      "</body></html>")
   );
 
   server.sendContent("");
