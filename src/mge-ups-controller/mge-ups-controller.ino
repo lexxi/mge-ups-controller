@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D5
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.12.1";
+static const char *APP_VERSION = "0.12.2";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -24,6 +24,15 @@ SoftwareSerial mgeSerial(MGE_RX_PIN, MGE_TX_PIN);
 String wifiSsid;
 String wifiPassword;
 bool apMode = false;
+
+static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
+static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+
+bool wifiWasConnected = false;
+unsigned long wifiLastRetryMillis = 0;
+unsigned long wifiReconnectAttempts = 0;
+unsigned long wifiReconnectSuccesses = 0;
+unsigned long wifiLastConnectedMillis = 0;
 
 // -----------------------------------------------------------------------------
 // Persistent logger
@@ -404,8 +413,17 @@ void startAccessPoint()
   String hostname = "MGE-USV-" + String(ESP.getChipId(), HEX);
   hostname.toUpperCase();
 
-  WiFi.mode(WIFI_AP);
+  // Keep STA enabled while the fallback AP is active. This allows the
+  // controller to keep retrying the configured WLAN in the background.
+  if (wifiSsid.length() > 0)
+    WiFi.mode(WIFI_AP_STA);
+  else
+    WiFi.mode(WIFI_AP);
+
   WiFi.softAP(hostname.c_str(), AP_PASSWORD);
+
+  if (wifiSsid.length() > 0)
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 
   logPrintln();
   logPrintln("Fallback AP started");
@@ -430,7 +448,7 @@ bool connectWifi()
   unsigned long start = millis();
 
   while (WiFi.status() != WL_CONNECTED &&
-         millis() - start < 15000)
+         millis() - start < WIFI_CONNECT_TIMEOUT_MS)
   {
     delay(250);
     logPrint(".");
@@ -441,10 +459,15 @@ bool connectWifi()
   if (WiFi.status() == WL_CONNECTED)
   {
     apMode = false;
+    wifiWasConnected = true;
+    wifiLastConnectedMillis = millis();
 
     logPrintln("WiFi connected");
     logPrint("IP: ");
     logPrintln(WiFi.localIP());
+    logPrint("RSSI: ");
+    logPrint(WiFi.RSSI());
+    logPrintln(" dBm");
 
     return true;
   }
@@ -452,6 +475,74 @@ bool connectWifi()
   logPrintln("WiFi connection failed");
 
   return false;
+}
+
+const char *wifiSignalRating(int32_t rssi)
+{
+  if (rssi >= -50) return "sehr gut";
+  if (rssi >= -60) return "gut";
+  if (rssi >= -67) return "brauchbar";
+  if (rssi >= -70) return "grenzwertig";
+  return "schlecht";
+}
+
+void maintainWifi()
+{
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected)
+  {
+    if (!wifiWasConnected)
+    {
+      wifiWasConnected = true;
+      wifiReconnectSuccesses++;
+      wifiLastConnectedMillis = millis();
+
+      logPrintln("WiFi reconnected");
+      logPrint("IP: ");
+      logPrintln(WiFi.localIP());
+      logPrint("RSSI: ");
+      logPrint(WiFi.RSSI());
+      logPrintln(" dBm");
+
+      // Once STA is back, the fallback AP is no longer needed.
+      if (apMode)
+      {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        apMode = false;
+        logPrintln("Fallback AP stopped");
+      }
+
+      syncClock();
+    }
+
+    return;
+  }
+
+  if (wifiWasConnected)
+  {
+    wifiWasConnected = false;
+    logPrintln("WiFi connection lost");
+  }
+
+  if (wifiSsid.length() == 0)
+    return;
+
+  if (millis() - wifiLastRetryMillis < WIFI_RETRY_INTERVAL_MS)
+    return;
+
+  wifiLastRetryMillis = millis();
+  wifiReconnectAttempts++;
+
+  logPrintf("WiFi reconnect attempt %lu\n", wifiReconnectAttempts);
+
+  if (apMode)
+    WiFi.mode(WIFI_AP_STA);
+  else
+    WiFi.mode(WIFI_STA);
+
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
 }
 
 // -----------------------------------------------------------------------------
@@ -2356,9 +2447,77 @@ void handleLogClear()
 void handleConfig()
 {
   String body;
+  bool connected = (WiFi.status() == WL_CONNECTED);
 
-  body += F("<div class='card'><h1>WLAN configuration</h1>");
+  body += F("<div class='card'><h1>WLAN</h1>");
+  body += F("<table>");
 
+  body += F("<tr><td>Status</td><td><b>");
+  if (connected)
+    body += F("verbunden");
+  else if (apMode)
+    body += F("Fallback AP aktiv");
+  else
+    body += F("nicht verbunden");
+  body += F("</b></td></tr>");
+
+  body += F("<tr><td>Konfigurierte SSID</td><td>");
+  body += wifiSsid.length() ? wifiSsid : String("-");
+  body += F("</td></tr>");
+
+  body += F("<tr><td>Betriebsart</td><td>");
+  if (apMode && connected)
+    body += F("STA + AP");
+  else if (apMode)
+    body += F("Fallback AP");
+  else
+    body += F("STA");
+  body += F("</td></tr>");
+
+  body += F("<tr><td>IP-Adresse</td><td>");
+  body += connected ? WiFi.localIP().toString() : String("-");
+  body += F("</td></tr>");
+
+  body += F("<tr><td>MAC-Adresse</td><td>");
+  body += WiFi.macAddress();
+  body += F("</td></tr>");
+
+  if (connected)
+  {
+    int32_t rssi = WiFi.RSSI();
+
+    body += F("<tr><td>Signalstärke</td><td>");
+    body += String(rssi);
+    body += F(" dBm (");
+    body += wifiSignalRating(rssi);
+    body += F(")</td></tr>");
+
+    body += F("<tr><td>BSSID / Access Point</td><td>");
+    body += WiFi.BSSIDstr();
+    body += F("</td></tr>");
+
+    body += F("<tr><td>Kanal</td><td>");
+    body += String(WiFi.channel());
+    body += F("</td></tr>");
+
+    body += F("<tr><td>Verbunden seit</td><td>");
+    body += formatUptime();
+    body += F(" Uptime; letzter Connect bei ");
+    body += String(wifiLastConnectedMillis / 1000UL);
+    body += F(" s</td></tr>");
+  }
+
+  body += F("<tr><td>Reconnect-Versuche</td><td>");
+  body += String(wifiReconnectAttempts);
+  body += F("</td></tr>");
+
+  body += F("<tr><td>Erfolgreiche Reconnects</td><td>");
+  body += String(wifiReconnectSuccesses);
+  body += F("</td></tr>");
+
+  body += F("</table></div>");
+
+  body += F("<div class='card'><h2>WLAN-Konfiguration</h2>");
   body += F("<form method='POST' action='/save'>");
 
   body += F("<label>SSID</label>");
@@ -2366,21 +2525,21 @@ void handleConfig()
   body += wifiSsid;
   body += F("' required>");
 
-  body += F("<label>Password</label>");
-  body += F("<input type='password' name='password' value='");
-  body += wifiPassword;
-  body += F("'>");
+  body += F("<label>Passwort</label>");
+  body += F("<input type='password' name='password' value='' placeholder='Leer lassen = bestehendes Passwort behalten'>");
 
-  body += F("<button type='submit'>Save and restart</button>");
+  body += F("<button type='submit'>Speichern und neu starten</button>");
 
   body += F("</form>");
-  body += F("<p><a href='/'>Back</a></p>");
+  body += F("<p><small>Das gespeicherte WLAN-Passwort wird nicht angezeigt.</small></p>");
+  body += F("<p><button type='button' onclick='location.reload()'>Refresh</button> ");
+  body += F("<a href='/'>Zurück</a></p>");
   body += F("</div>");
 
   server.send(
     200,
     "text/html",
-    htmlPage("WLAN configuration", body)
+    htmlPage("WLAN", body)
   );
 }
 
@@ -2398,7 +2557,11 @@ void handleSave()
   }
 
   wifiSsid = server.arg("ssid");
-  wifiPassword = server.arg("password");
+
+  // Empty password means: keep the currently stored password.
+  // This avoids exposing the password in the WLAN configuration page.
+  if (server.hasArg("password") && server.arg("password").length() > 0)
+    wifiPassword = server.arg("password");
 
   saveConfig();
 
@@ -2481,6 +2644,7 @@ void setup()
 void loop()
 {
   server.handleClient();
+  maintainWifi();
   readMgeSerial();
   pollShutTelemetry();
 }
