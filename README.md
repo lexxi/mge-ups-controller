@@ -38,8 +38,8 @@ Implemented and verified:
 - LOLIN / WEMOS D1 mini (ESP8266)
 - UPS serial interface: 2400 baud, 8N1
 - SoftwareSerial:
-  - RX: D5
-  - TX: D6
+  - RX: D6
+  - TX: D5
 - isolated serial interface recommended for permanent installation
 
 See [docs/hardware.md](docs/hardware.md) for hardware details.
