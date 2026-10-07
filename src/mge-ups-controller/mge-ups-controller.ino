@@ -6,8 +6,8 @@
 #include <time.h>
 #include <stdarg.h>
 
-#define MGE_RX_PIN D5
-#define MGE_TX_PIN D6
+#define MGE_RX_PIN D6
+#define MGE_TX_PIN D5
 
 static const char *AP_PASSWORD = "mgeups123";
 static const char *APP_VERSION = "0.12.1";
@@ -2444,7 +2444,7 @@ void setup()
   mgeSerial.begin(2400);
 
   logPrintln("MGE serial initialized: 2400 8N1");
-  logPrintln("RX=D5 TX=D6");
+  logPrintln("RX=D6 TX=D5");
 
   if (!connectWifi())
   {
