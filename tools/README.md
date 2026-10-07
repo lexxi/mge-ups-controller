@@ -2,7 +2,7 @@
 
 Diese Tools gehören **nicht** zur produktiven Monitoring-App. Sie dokumentieren die Tests, mit denen das serielle MGE-SHUT-Protokoll der konkreten USV untersucht wurde.
 
-Hardware: ESP8266/LOLIN, 2400 8N1, MGE RX=D5, TX=D6.
+Hardware: ESP8266/LOLIN, 2400 8N1, MGE RX=D6, TX=D5.
 
 ## Tools
 
