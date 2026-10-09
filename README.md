@@ -175,3 +175,18 @@ Use the controller only on a trusted network or restrict access externally.
 Protocol implementation work was cross-checked against historical Network UPS Tools (NUT) MGE SHUT sources and MGE HID documentation.
 
 See [engineering/README.md](engineering/README.md) for pinned upstream references and reverse-engineering notes.
+
+
+## WLAN / Roaming
+
+Firmware v0.12.3 ergänzt die WLAN-Diagnose um Scan und RSSI-basiertes Roaming:
+
+- Scan der sichtbaren 2,4-GHz-WLANs auf `/config`
+- Anzeige von SSID, BSSID, RSSI, Kanal und Verschlüsselung
+- Roaming-Prüfung alle 60 Sekunden, wenn das aktuelle Signal unter dem konfigurierten Schwellwert liegt
+- Standard-Schwellwert: `-72 dBm`
+- AP-Wechsel nur bei mindestens `4 dB` Verbesserung
+- Roaming-Versuche und erfolgreiche Roams werden auf der WLAN-Seite gezählt
+- Reconnect/Fallback-AP-Logik bleibt aktiv
+
+Die Roaming-Werte werden zusammen mit der WLAN-Konfiguration in `/wifi.cfg` gespeichert.
