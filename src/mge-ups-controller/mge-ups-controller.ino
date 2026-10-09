@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D5
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.12.2";
+static const char *APP_VERSION = "0.12.3";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -27,12 +27,22 @@ bool apMode = false;
 
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 30000;
+static const unsigned long WIFI_ROAM_CHECK_INTERVAL_MS = 60000;
+static const int WIFI_ROAM_TRIGGER_RSSI_DEFAULT = -72;
+static const int WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT = 4;
 
 bool wifiWasConnected = false;
 unsigned long wifiLastRetryMillis = 0;
 unsigned long wifiReconnectAttempts = 0;
 unsigned long wifiReconnectSuccesses = 0;
 unsigned long wifiLastConnectedMillis = 0;
+unsigned long wifiLastRoamCheckMillis = 0;
+unsigned long wifiRoamAttempts = 0;
+unsigned long wifiRoamSuccesses = 0;
+bool wifiRoamInProgress = false;
+String wifiRoamTargetBssid;
+int wifiRoamTriggerRssi = WIFI_ROAM_TRIGGER_RSSI_DEFAULT;
+int wifiRoamMinImprovementDb = WIFI_ROAM_MIN_IMPROVEMENT_DB_DEFAULT;
 
 // -----------------------------------------------------------------------------
 // Persistent logger
@@ -287,14 +297,15 @@ bool rxInFrame = false;
 // HTML
 // -----------------------------------------------------------------------------
 
-String htmlPage(const String &title, const String &body)
+String htmlPage(const String &title, const String &body, bool autoRefresh = true)
 {
   String html;
   html.reserve(9000);
 
   html += F("<!doctype html><html><head><meta charset='utf-8'>");
   html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
-  html += F("<meta http-equiv='refresh' content='5'>");
+  if (autoRefresh)
+    html += F("<meta http-equiv='refresh' content='5'>");
   html += F("<title>");
   html += title;
   html += F("</title>");
@@ -382,6 +393,8 @@ void saveConfig()
 
   file.println(wifiSsid);
   file.println(wifiPassword);
+  file.println(wifiRoamTriggerRssi);
+  file.println(wifiRoamMinImprovementDb);
   file.close();
 }
 
@@ -400,6 +413,23 @@ bool loadConfig()
 
   wifiSsid.trim();
   wifiPassword.trim();
+
+  // Optional since v0.12.3; old two-line configs remain valid.
+  if (file.available())
+  {
+    String value = file.readStringUntil('\n');
+    value.trim();
+    if (value.length() > 0)
+      wifiRoamTriggerRssi = constrain(value.toInt(), -95, -50);
+  }
+
+  if (file.available())
+  {
+    String value = file.readStringUntil('\n');
+    value.trim();
+    if (value.length() > 0)
+      wifiRoamMinImprovementDb = constrain(value.toInt(), 1, 20);
+  }
 
   file.close();
 
@@ -495,10 +525,20 @@ void maintainWifi()
     if (!wifiWasConnected)
     {
       wifiWasConnected = true;
-      wifiReconnectSuccesses++;
-      wifiLastConnectedMillis = millis();
 
-      logPrintln("WiFi reconnected");
+      if (wifiRoamInProgress)
+      {
+        wifiRoamSuccesses++;
+        wifiRoamInProgress = false;
+        logPrintln("WiFi roam completed");
+      }
+      else
+      {
+        wifiReconnectSuccesses++;
+        logPrintln("WiFi reconnected");
+      }
+
+      wifiLastConnectedMillis = millis();
       logPrint("IP: ");
       logPrintln(WiFi.localIP());
       logPrint("RSSI: ");
@@ -532,6 +572,12 @@ void maintainWifi()
   if (millis() - wifiLastRetryMillis < WIFI_RETRY_INTERVAL_MS)
     return;
 
+  if (wifiRoamInProgress)
+  {
+    logPrintln("WiFi roam timed out; falling back to normal reconnect");
+    wifiRoamInProgress = false;
+  }
+
   wifiLastRetryMillis = millis();
   wifiReconnectAttempts++;
 
@@ -543,6 +589,115 @@ void maintainWifi()
     WiFi.mode(WIFI_STA);
 
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+}
+
+void checkForBetterAccessPoint()
+{
+  if (WiFi.status() != WL_CONNECTED || apMode || wifiSsid.length() == 0)
+    return;
+
+  if (wifiRoamInProgress)
+    return;
+
+  if (millis() - wifiLastRoamCheckMillis < WIFI_ROAM_CHECK_INTERVAL_MS)
+    return;
+
+  wifiLastRoamCheckMillis = millis();
+
+  int currentRssi = WiFi.RSSI();
+
+  // Do not interrupt a healthy connection with scans.
+  if (currentRssi >= wifiRoamTriggerRssi)
+    return;
+
+  String currentBssid = WiFi.BSSIDstr();
+
+  logPrintf("Roam scan: current AP %s at %d dBm\n",
+            currentBssid.c_str(), currentRssi);
+
+  int networkCount = WiFi.scanNetworks(false, false);
+
+  if (networkCount <= 0)
+  {
+    WiFi.scanDelete();
+    return;
+  }
+
+  int bestRssi = currentRssi;
+  int bestChannel = 0;
+  uint8_t bestBssid[6] = {0};
+  String bestBssidString;
+  bool betterApFound = false;
+
+  for (int i = 0; i < networkCount; i++)
+  {
+    if (WiFi.SSID(i) != wifiSsid)
+      continue;
+
+    String candidateBssid = WiFi.BSSIDstr(i);
+
+    if (candidateBssid == currentBssid)
+      continue;
+
+    int candidateRssi = WiFi.RSSI(i);
+
+    if (candidateRssi > bestRssi)
+    {
+      const uint8_t *candidate = WiFi.BSSID(i);
+
+      if (candidate)
+      {
+        bestRssi = candidateRssi;
+        bestChannel = WiFi.channel(i);
+        memcpy(bestBssid, candidate, 6);
+        bestBssidString = candidateBssid;
+        betterApFound = true;
+      }
+    }
+  }
+
+  WiFi.scanDelete();
+
+  if (!betterApFound)
+  {
+    logPrintln("Roam scan: no other AP with configured SSID found");
+    return;
+  }
+
+  logPrintf("Roam scan: best candidate %s at %d dBm (%+d dB)\n",
+            bestBssidString.c_str(),
+            bestRssi,
+            bestRssi - currentRssi);
+
+  if (bestRssi < currentRssi + wifiRoamMinImprovementDb)
+  {
+    logPrintf("Roam scan: improvement below %d dB threshold; staying on current AP\n",
+              wifiRoamMinImprovementDb);
+    return;
+  }
+
+  wifiRoamAttempts++;
+  wifiRoamInProgress = true;
+  wifiRoamTargetBssid = bestBssidString;
+  wifiLastRetryMillis = millis();
+  wifiWasConnected = false;
+
+  logPrintf("Roaming from %s (%d dBm) to %s (%d dBm), channel %d\n",
+            currentBssid.c_str(),
+            currentRssi,
+            bestBssidString.c_str(),
+            bestRssi,
+            bestChannel);
+
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(
+      wifiSsid.c_str(),
+      wifiPassword.c_str(),
+      bestChannel,
+      bestBssid,
+      true);
 }
 
 // -----------------------------------------------------------------------------
@@ -2444,13 +2599,42 @@ void handleLogClear()
   logPrintln("System log cleared");
 }
 
+String htmlEscape(const String &value)
+{
+  String out;
+  out.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); i++)
+  {
+    char ch = value[i];
+
+    if (ch == '&') out += F("&amp;");
+    else if (ch == '<') out += F("&lt;");
+    else if (ch == '>') out += F("&gt;");
+    else if (ch == '"') out += F("&quot;");
+    else if (ch == '\'') out += F("&#39;");
+    else out += ch;
+  }
+
+  return out;
+}
+
+String jsSingleQuoteEscape(const String &value)
+{
+  String out = value;
+  out.replace("\\", "\\\\");
+  out.replace("'", "\\'");
+  out.replace("\r", "");
+  out.replace("\n", "");
+  return out;
+}
+
 void handleConfig()
 {
   String body;
   bool connected = (WiFi.status() == WL_CONNECTED);
 
-  body += F("<div class='card'><h1>WLAN</h1>");
-  body += F("<table>");
+  body += F("<div class='card'><h1>WLAN</h1><table>");
 
   body += F("<tr><td>Status</td><td><b>");
   if (connected)
@@ -2462,16 +2646,13 @@ void handleConfig()
   body += F("</b></td></tr>");
 
   body += F("<tr><td>Konfigurierte SSID</td><td>");
-  body += wifiSsid.length() ? wifiSsid : String("-");
+  body += wifiSsid.length() ? htmlEscape(wifiSsid) : String("-");
   body += F("</td></tr>");
 
   body += F("<tr><td>Betriebsart</td><td>");
-  if (apMode && connected)
-    body += F("STA + AP");
-  else if (apMode)
-    body += F("Fallback AP");
-  else
-    body += F("STA");
+  if (apMode && connected) body += F("STA + AP");
+  else if (apMode) body += F("Fallback AP");
+  else body += F("STA");
   body += F("</td></tr>");
 
   body += F("<tr><td>IP-Adresse</td><td>");
@@ -2485,62 +2666,125 @@ void handleConfig()
   if (connected)
   {
     int32_t rssi = WiFi.RSSI();
-
     body += F("<tr><td>Signalstärke</td><td>");
     body += String(rssi);
     body += F(" dBm (");
     body += wifiSignalRating(rssi);
-    body += F(")</td></tr>");
-
-    body += F("<tr><td>BSSID / Access Point</td><td>");
+    body += F(")</td></tr><tr><td>BSSID / Access Point</td><td>");
     body += WiFi.BSSIDstr();
-    body += F("</td></tr>");
-
-    body += F("<tr><td>Kanal</td><td>");
+    body += F("</td></tr><tr><td>Kanal</td><td>");
     body += String(WiFi.channel());
     body += F("</td></tr>");
-
-    body += F("<tr><td>Verbunden seit</td><td>");
-    body += formatUptime();
-    body += F(" Uptime; letzter Connect bei ");
-    body += String(wifiLastConnectedMillis / 1000UL);
-    body += F(" s</td></tr>");
   }
 
   body += F("<tr><td>Reconnect-Versuche</td><td>");
   body += String(wifiReconnectAttempts);
-  body += F("</td></tr>");
-
-  body += F("<tr><td>Erfolgreiche Reconnects</td><td>");
+  body += F("</td></tr><tr><td>Erfolgreiche Reconnects</td><td>");
   body += String(wifiReconnectSuccesses);
-  body += F("</td></tr>");
+  body += F("</td></tr><tr><td>Roaming-Versuche</td><td>");
+  body += String(wifiRoamAttempts);
+  body += F("</td></tr><tr><td>Erfolgreiche Roams</td><td>");
+  body += String(wifiRoamSuccesses);
+  body += F("</td></tr></table></div>");
 
-  body += F("</table></div>");
-
-  body += F("<div class='card'><h2>WLAN-Konfiguration</h2>");
-  body += F("<form method='POST' action='/save'>");
-
-  body += F("<label>SSID</label>");
-  body += F("<input name='ssid' value='");
-  body += wifiSsid;
+  body += F("<div class='card'><h2>Roaming</h2>");
+  body += F("<form method='POST' action='/roaming/save'>");
+  body += F("<label>Roaming-Scan ab RSSI schlechter als (dBm)</label>");
+  body += F("<input type='number' min='-95' max='-50' name='trigger_rssi' value='");
+  body += String(wifiRoamTriggerRssi);
   body += F("' required>");
+  body += F("<label>Mindestverbesserung für AP-Wechsel (dB)</label>");
+  body += F("<input type='number' min='1' max='20' name='min_improve_db' value='");
+  body += String(wifiRoamMinImprovementDb);
+  body += F("' required>");
+  body += F("<button type='submit'>Roaming speichern</button></form>");
+  body += F("<p><small>Standard: -72 dBm / 4 dB. Prüfung alle 60 Sekunden, aber nur wenn das aktuelle Signal unter der Schwelle liegt.</small></p></div>");
 
+  int networkCount = WiFi.scanNetworks(false, false);
+
+  body += F("<div class='card'><h2>Gefundene WLANs</h2>");
+  body += F("<p><small>Nur 2,4-GHz-WLAN. SSID anklicken, um sie unten zu übernehmen.</small></p>");
+
+  if (networkCount <= 0)
+  {
+    body += F("<p>Keine WLANs gefunden.</p>");
+  }
+  else
+  {
+    body += F("<table><tr><th>SSID</th><th>BSSID</th><th>Signal</th><th>Kanal</th><th>Sicherheit</th></tr>");
+
+    for (int i = 0; i < networkCount; i++)
+    {
+      String scannedSsid = WiFi.SSID(i);
+      body += F("<tr><td>");
+
+      if (scannedSsid.length())
+      {
+        body += F("<button type='button' onclick=\"selectSsid('");
+        body += jsSingleQuoteEscape(scannedSsid);
+        body += F("')\">");
+        body += htmlEscape(scannedSsid);
+        body += F("</button>");
+      }
+      else
+      {
+        body += F("<i>versteckt</i>");
+      }
+
+      body += F("</td><td><code>");
+      body += WiFi.BSSIDstr(i);
+      body += F("</code></td><td>");
+      body += String(WiFi.RSSI(i));
+      body += F(" dBm</td><td>");
+      body += String(WiFi.channel(i));
+      body += F("</td><td>");
+      body += (WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "offen" : "geschützt";
+      body += F("</td></tr>");
+    }
+
+    body += F("</table>");
+  }
+
+  WiFi.scanDelete();
+  body += F("<p><a href='/config'>Erneut scannen</a></p></div>");
+
+  body += F("<div class='card'><h2>WLAN verbinden</h2>");
+  body += F("<form method='POST' action='/save'>");
+  body += F("<label>SSID</label><input id='ssid' name='ssid' value='");
+  body += htmlEscape(wifiSsid);
+  body += F("' required>");
   body += F("<label>Passwort</label>");
   body += F("<input type='password' name='password' value='' placeholder='Leer lassen = bestehendes Passwort behalten'>");
-
-  body += F("<button type='submit'>Speichern und neu starten</button>");
-
-  body += F("</form>");
-  body += F("<p><small>Das gespeicherte WLAN-Passwort wird nicht angezeigt.</small></p>");
-  body += F("<p><button type='button' onclick='location.reload()'>Refresh</button> ");
-  body += F("<a href='/'>Zurück</a></p>");
-  body += F("</div>");
+  body += F("<button type='submit'>Speichern und neu starten</button></form>");
+  body += F("<p><small>Das gespeicherte Passwort wird nicht angezeigt.</small></p>");
+  body += F("<p><a href='/'>Zurück</a></p></div>");
+  body += F("<script>function selectSsid(s){document.getElementById('ssid').value=s;document.getElementById('ssid').scrollIntoView({behavior:'smooth',block:'center'});}</script>");
 
   server.send(
     200,
     "text/html",
-    htmlPage("WLAN", body)
+    htmlPage("WLAN", body, false)
   );
+}
+
+void handleRoamingSave()
+{
+  if (!server.hasArg("trigger_rssi") || !server.hasArg("min_improve_db"))
+  {
+    server.send(400, "text/plain", "Roaming settings missing");
+    return;
+  }
+
+  wifiRoamTriggerRssi = constrain(server.arg("trigger_rssi").toInt(), -95, -50);
+  wifiRoamMinImprovementDb = constrain(server.arg("min_improve_db").toInt(), 1, 20);
+  saveConfig();
+
+  logPrintf("Roaming settings saved: trigger=%d dBm, improvement=%d dB\n",
+            wifiRoamTriggerRssi,
+            wifiRoamMinImprovementDb);
+
+  server.sendHeader("Location", "/config");
+  server.send(303, "text/plain", "");
 }
 
 void handleSave()
@@ -2634,6 +2878,7 @@ void setup()
   server.on("/logs/download", HTTP_GET, handleLogDownload);
   server.on("/logs/clear", HTTP_GET, handleLogClear);
   server.on("/config", HTTP_GET, handleConfig);
+  server.on("/roaming/save", HTTP_POST, handleRoamingSave);
   server.on("/save", HTTP_POST, handleSave);
 
   server.begin();
@@ -2645,6 +2890,7 @@ void loop()
 {
   server.handleClient();
   maintainWifi();
+  checkForBetterAccessPoint();
   readMgeSerial();
   pollShutTelemetry();
 }
