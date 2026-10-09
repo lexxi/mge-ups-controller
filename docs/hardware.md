@@ -64,3 +64,8 @@ Serial connection at the UPS controller board used for the SHUT interface tests.
 ![ESP8266 and isolated serial test setup](images/esp8266-test-setup.jpg)
 
 LOLIN/WEMOS D1 mini test setup with the isolated serial interface connected to the MGE Ellipse UPS.
+
+
+## WLAN
+
+Der ESP8266 nutzt ausschließlich 2,4 GHz. Ab Firmware v0.12.3 unterstützt die WLAN-Seite Netzwerk-Scan und RSSI-basiertes Roaming zwischen Access Points mit identischer SSID. Standardmäßig wird ab schlechter als -72 dBm nach einem besseren AP gesucht; gewechselt wird erst ab mindestens 4 dB Verbesserung.
