@@ -10,7 +10,7 @@
 #define MGE_TX_PIN D5
 
 static const char *AP_PASSWORD = "mgeups123";
-static const char *APP_VERSION = "0.12.3";
+static const char *APP_VERSION = "0.12.4";
 static const char *CONFIG_FILE = "/wifi.cfg";
 static const char *LOG_FILE = "/system.log";
 static const size_t LOG_MAX_BYTES = 128 * 1024;
@@ -2814,8 +2814,10 @@ void handleSave()
     "text/html",
     htmlPage(
       "Saved",
-      "<div class='card'><h1>Saved</h1>"
-      "<p>Configuration saved. Restarting...</p></div>"
+      "<div class='card'><h1>Gespeichert</h1>"
+      "<p>WLAN-Konfiguration gespeichert. Controller startet neu.</p>"
+      "<p><a href='/'>Zur Startseite</a></p></div>",
+      false
     )
   );
 
